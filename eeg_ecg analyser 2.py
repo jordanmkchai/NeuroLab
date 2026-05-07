@@ -1,8 +1,29 @@
 import os
+import sys
+
+
+def _relaunch_with_project_python():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_python = os.path.join(script_dir, ".venv", "Scripts", "python.exe")
+    if not os.path.exists(project_python):
+        return
+    current = os.path.normcase(os.path.abspath(sys.executable))
+    target = os.path.normcase(os.path.abspath(project_python))
+    if current == target:
+        return
+    if os.environ.get("EEG_ECG_ANALYSER_BOOTSTRAPPED") == "1":
+        return
+    os.environ["EEG_ECG_ANALYSER_BOOTSTRAPPED"] = "1"
+    import subprocess as _subprocess
+    raise SystemExit(_subprocess.call([project_python, os.path.abspath(__file__), *sys.argv[1:]]))
+
+
+_relaunch_with_project_python()
+
 import json
 import argparse
-import sys
 import threading
+import subprocess
 import pathlib
 import warnings
 from datetime import datetime
@@ -48,9 +69,28 @@ ECG_INTERVAL_COLUMNS_MS = [
     "QTc_Bazett_ms",
 ]
 
+EEG_EVENT_TYPES = ["Spike", "SWD", "Seizure"]
+EEG_EVENT_COLUMNS = [
+    "Event_Index",
+    "Type",
+    "Start_s",
+    "End_s",
+    "Duration_s",
+    "Confidence",
+    "Is_Corrected",
+    "Is_Deleted",
+    "Corrected_At",
+    "Correction_Source",
+    "Correction_Notes",
+]
+
 CORRECTION_STORE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "ecg_corrections_v2.json",
+)
+EEG_CORRECTION_STORE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "eeg_corrections_v1.json",
 )
 
 
@@ -69,10 +109,11 @@ def load_waveform_tabular(file_path: str):
         ).values
 
     if ext in ['.tsv', '.txt', '.csv']:
-        sep = '\t' if ext == '.tsv' else None
+        sep = '\t' if ext in ['.tsv', '.txt'] else ','
         try:
             df = pd.read_csv(file_path, sep=sep, header=None,
-                             skiprows=7, usecols=[3, 4], engine='python')
+                             skiprows=7, usecols=[3, 4], engine='c',
+                             on_bad_lines='skip')
         except Exception:
             df = pd.read_csv(file_path, sep=None, header=None,
                              skiprows=7, usecols=[3, 4], engine='python')
@@ -725,13 +766,14 @@ def _find_t_offset_threshold(y_seg, fs, qrs_off_local, search_end, qrs_on_local=
     r_local = int(max(0, min(n - 1, int(round(r_local)))))
     qrs_off_local = int(max(0, min(n - 1, int(round(qrs_off_local)))))
 
-    start = max(qrs_off_local + int(0.008 * fs), r_local + int(0.016 * fs))
+    # Tuned on corrected beats: T_off typically emerges in early post-R flat return.
+    start = max(qrs_off_local + int(0.014 * fs), r_local + int(0.022 * fs))
     end_cap = r_local + int(0.038 * fs)
     end = min(n - 1, int(search_end), end_cap)
     if end <= start + 3:
         return np.nan
 
-    # Baseline from P_on when available, else pre-R quiet window.
+    # Latest manual review aligns T_off to the early flat return near the P_on baseline.
     if p_on_local is not None and np.isfinite(p_on_local):
         p_idx = int(max(0, min(n - 1, int(round(p_on_local)))))
         baseline = float(y_seg[p_idx])
@@ -747,17 +789,18 @@ def _find_t_offset_threshold(y_seg, fs, qrs_off_local, search_end, qrs_on_local=
 
     amp_peak = abs(float(y_seg[t_peak] - baseline))
     local_ptp = float(np.ptp(y_seg[max(0, r_local - int(0.050 * fs)):min(n, r_local + int(0.100 * fs))]))
-    amp_thr = max(0.40 * amp_peak, 0.01 * local_ptp)
+    amp_thr = max(0.50 * amp_peak, 0.030 * local_ptp)
 
     dy = np.abs(np.gradient(y_seg))
-    dy_sm = uniform_filter1d(dy, size=max(1, int(0.002 * fs)), mode="nearest")
-    slope_thr = float(np.percentile(dy_sm[start:end + 1], 20))
+    dy_sm = uniform_filter1d(dy, size=max(1, int(0.001 * fs)), mode="nearest")
+    slope_thr = float(np.percentile(dy_sm[start:end + 1], 18))
 
-    for k in range(t_peak, end + 1):
-        if abs(y_seg[k] - baseline) <= amp_thr and dy_sm[k] <= slope_thr:
+    run = max(1, int(0.0005 * fs))
+    for k in range(start, end - run + 2):
+        if np.all(np.abs(y_seg[k:k + run] - baseline) <= amp_thr) and np.all(dy_sm[k:k + run] <= slope_thr):
             return float(k)
 
-    cand = np.arange(t_peak, end + 1, dtype=int)
+    cand = np.arange(start, end + 1, dtype=int)
     score = np.abs(y_seg[cand] - baseline) / (amp_thr + 1e-9) + dy_sm[cand] / (slope_thr + 1e-9)
     return float(cand[int(np.argmin(score))])
 
@@ -987,17 +1030,23 @@ def refine_qrs_t(sig_filt, fs, rpeaks, waves):
         # ── P-wave: wavelet -> signal-based -> fallback -> template ──
         p_on_abs = np.nan
         p_off_abs = np.nan
+        p_signal_off_abs = np.nan
         if np.isfinite(P_on0[i]) and np.isfinite(P_off0[i]):
             cand_on = float(P_on0[i])
             cand_off = float(P_off0[i])
             p_dur_ms0 = (cand_off - cand_on) / fs * 1000.0
             if cand_on < cand_off < qrs_on_abs and 5.0 <= p_dur_ms0 <= 70.0:
                 p_on_abs, p_off_abs = cand_on, cand_off
+                p_signal_off_abs = cand_off
         if not (np.isfinite(p_on_abs) and np.isfinite(p_off_abs)):
             qrs_on_local_samp = qrs_on_abs - s
             p_on_local, p_off_local = _find_p_wave(y_seg, fs, qrs_on_local_samp, rr_s=rr_i)
+            if np.isfinite(p_off_local):
+                p_signal_off_abs = float(s + p_off_local)
             if not (np.isfinite(p_on_local) and np.isfinite(p_off_local)):
                 p_on_local, p_off_local = _fallback_p_wave_simple(y_seg, fs, qrs_on_local_samp, rr_s=rr_i)
+                if np.isfinite(p_off_local):
+                    p_signal_off_abs = float(s + p_off_local)
             if not (np.isfinite(p_on_local) and np.isfinite(p_off_local)):
                 p_on_local, p_off_local = _template_p_wave_from_r(y_seg, fs, r_loc, qrs_on_local_samp)
             p_on_abs = float(s + p_on_local) if np.isfinite(p_on_local) else np.nan
@@ -1015,7 +1064,19 @@ def refine_qrs_t(sig_filt, fs, rpeaks, waves):
             if not np.isfinite(p_off_abs):
                 p_off_abs = float(s + tpl_off)
             else:
-                if abs((p_off_abs - s) - tpl_off) > gate:
+                p_off_adjusted = False
+                if np.isfinite(p_signal_off_abs) and np.isfinite(p_on_abs):
+                    signal_off_local = p_signal_off_abs - s
+                    diff_ms = (signal_off_local - tpl_off) / fs * 1000.0
+                    signal_dur_ms = (p_signal_off_abs - p_on_abs) / fs * 1000.0
+                    signal_pr_ms = (qrs_on_abs - p_signal_off_abs) / fs * 1000.0
+                    if diff_ms > 5.0 and 8.0 <= signal_pr_ms <= 18.0 and 8.0 <= signal_dur_ms <= 30.0:
+                        p_off_abs = p_signal_off_abs
+                        p_off_adjusted = True
+                    elif diff_ms < -10.0 and signal_dur_ms < 5.0:
+                        p_off_abs = float(p_on_abs + int(round(0.011 * fs)))
+                        p_off_adjusted = True
+                if not p_off_adjusted and abs((p_off_abs - s) - tpl_off) > gate:
                     p_off_abs = float(s + tpl_off)
         if np.isfinite(p_off_abs) and p_off_abs >= qrs_on_abs:
             p_off_abs = float(qrs_on_abs - int(0.004 * fs))
@@ -1246,9 +1307,14 @@ def detect_spikes(sig, fs,
                   rtob_frac=0.25,
                   ampz_thresh=4.2,
                   ampz_win_s=1.5,
+                  hf_lf_ratio_min=0.35,
                   biphasic_mode='soft',
                   bip_win_ms=25.0,
-                  bip_ratio_min=0.35):
+                  bip_ratio_min=0.35,
+                  post_artifact_frac=0.30,
+                  post_artifact_bip_max=0.20,
+                  low_ampz_strict=12.0,
+                  low_amp_bip_min=0.45):
     sos    = butter_bandpass_sos(fs, bp[0], bp[1], order=4)
     hf     = sosfiltfilt(sos, sig)
     hf_abs = np.abs(hf)
@@ -1291,11 +1357,13 @@ def detect_spikes(sig, fs,
         if sharp < curv_thresh * base_curv:
             continue
 
+        post_ratio = np.nan
         a, b = p + int(0.04 * fs), min(n, p + int(0.08 * fs))
         if b > a:
             post_env  = float(np.mean(np.abs(sig[a:b])))
             spike_env = float(np.max(np.abs(sig[core_left:core_right]))) + 1e-9
-            if post_env > rtob_frac * spike_env:
+            post_ratio = post_env / spike_env
+            if post_ratio > rtob_frac:
                 continue
 
         sw  = int(0.08 * fs)
@@ -1303,7 +1371,7 @@ def detect_spikes(sig, fs,
         seg    = sig[s0:s1]
         if seg.size >= int(0.02 * fs):
             p30_80, p1_20 = band_power_fft(seg, fs, [(30, 80), (1, 20)])
-            if p1_20 <= 0 or (p30_80 / p1_20) < 1.5:
+            if p1_20 <= 0 or (p30_80 / p1_20) < hf_lf_ratio_min:
                 continue
 
         aw  = int(round(ampz_win_s * fs))
@@ -1326,6 +1394,10 @@ def detect_spikes(sig, fs,
                 bip_ratio = abs(opp) / main_abs
             if biphasic_mode == 'hard' and bip_ratio < bip_ratio_min:
                 continue
+        if np.isfinite(post_ratio) and post_ratio > post_artifact_frac and bip_ratio < post_artifact_bip_max:
+            continue
+        if z_amp < low_ampz_strict and bip_ratio < low_amp_bip_min:
+            continue
 
         slope_ratio = peak_slope / (base_grad + 1e-12)
         score       = (0.9 * (z_amp - ampz_thresh)
@@ -1334,24 +1406,29 @@ def detect_spikes(sig, fs,
         confidence  = float(1.0 / (1.0 + np.exp(-score)))
         results.append({"idx": int(p), "w_ms": float(w_ms), "z_amp": float(z_amp),
                          "slope": float(peak_slope), "curv": float(sharp),
-                         "bip_ratio": float(bip_ratio), "confidence": confidence})
+                         "bip_ratio": float(bip_ratio), "post_ratio": float(post_ratio),
+                         "confidence": confidence})
     return results
 
 
-def detect_swd(sig, fs, band=(5.0, 9.0), min_duration_s=0.5,
-               max_gap_s=0.5, power_ratio=2.5):
+def detect_swd(sig, fs, band=(5.0, 9.0), min_duration_s=1.0,
+               max_gap_s=0.35, power_ratio=2.0, env_z_thresh=2.6,
+               amp_ratio_min=1.8, cycle_cv_max=0.35, min_cycles=4,
+               harmonic_ratio_min=0.08):
     lo   = sosfiltfilt(butter_bandpass_sos(fs, band[0], band[1], 4), sig)
     env  = np.abs(hilbert(lo))
-    ref  = sosfiltfilt(butter_bandpass_sos(fs, 1.0, 20.0, 4), sig)
+    low_bg = sosfiltfilt(butter_bandpass_sos(fs, 1.0, max(1.1, band[0] - 0.5), 4), sig)
+    high_bg = sosfiltfilt(butter_bandpass_sos(fs, min(0.45 * fs - 1.0, band[1] + 0.5), min(20.0, 0.45 * fs), 4), sig)
     win  = max(1, int(fs * 0.5))
     num  = uniform_filter1d(lo * lo,  size=win, mode='nearest')
-    den  = uniform_filter1d(ref * ref, size=win, mode='nearest') + 1e-12
+    den  = uniform_filter1d(low_bg * low_bg + high_bg * high_bg, size=win, mode='nearest') + 1e-12
     ratio = num / den
 
     env_mean = uniform_filter1d(env,       size=win, mode='nearest')
     env_var  = uniform_filter1d(env * env, size=win, mode='nearest') - env_mean ** 2
     env_cv   = np.sqrt(np.maximum(0.0, env_var)) / (env_mean + 1e-12)
-    mask     = (ratio > power_ratio) & (env_cv < 0.6)
+    env_z    = (env_mean - np.median(env_mean)) / (mad(env_mean, scale='normal') + 1e-9)
+    mask     = (ratio > power_ratio) & (env_z > env_z_thresh) & (env_cv < 0.65)
 
     events, in_evt, start = [], False, 0
     for i, m in enumerate(mask):
@@ -1372,14 +1449,100 @@ def detect_swd(sig, fs, band=(5.0, 9.0), min_duration_s=0.5,
         if e["end"] - e["start"] < min_duration_s:
             continue
         a, b = int(e["start"] * fs), int(e["end"] * fs)
-        seg   = lo[a:b]
-        peaks, _ = find_peaks(seg, distance=max(1, int(fs / 12.0)))
-        if len(peaks) >= 4:
-            isi = np.diff(peaks) / fs
-            if float(np.std(isi) / (np.mean(isi) + 1e-12)) <= 0.25:
-                kept.append(e)
-        else:
-            kept.append(e)
+        if b <= a:
+            continue
+        seg = lo[a:b]
+        raw = sig[a:b]
+        dur = max(1e-12, e["end"] - e["start"])
+
+        pad = int(round(10.0 * fs))
+        gap = int(round(0.25 * fs))
+        base = np.r_[sig[max(0, a - pad):max(0, a - gap)],
+                     sig[min(len(sig), b + gap):min(len(sig), b + pad)]]
+        if base.size < max(10, int(fs)):
+            base = sig
+        seg_pp = float(np.percentile(raw, 95) - np.percentile(raw, 5))
+        base_pp = float(np.percentile(base, 95) - np.percentile(base, 5)) + 1e-9
+        amp_ratio = seg_pp / base_pp
+        if amp_ratio < amp_ratio_min:
+            continue
+
+        peaks, _ = find_peaks(seg, distance=max(1, int(fs / max(1.0, band[1] + 1.0))))
+        if len(peaks) < min_cycles:
+            continue
+        isi = np.diff(peaks) / fs
+        if isi.size == 0:
+            continue
+        mean_isi = float(np.mean(isi))
+        if mean_isi <= 0:
+            continue
+        freq = 1.0 / mean_isi
+        cycles = dur * freq
+        if not (band[0] <= freq <= band[1] and cycles >= min_cycles):
+            continue
+        if float(np.std(isi) / (mean_isi + 1e-12)) > cycle_cv_max:
+            continue
+
+        p_fund, p_harm = band_power_fft(raw, fs, [band, (2.0 * band[0], min(2.0 * band[1], 0.45 * fs))])
+        if p_fund <= 0 or (p_harm / (p_fund + 1e-12)) < harmonic_ratio_min:
+            continue
+        e = dict(e)
+        e["amp_ratio"] = float(amp_ratio)
+        e["dominant_hz"] = float(freq)
+        kept.append(e)
+    return kept
+
+
+def detect_rhythmic_discharges(sig, fs, band=(5.0, 12.0), min_duration_s=4.0,
+                               max_gap_s=0.5, power_ratio=1.4, env_z_thresh=2.0,
+                               env_cv_max=0.9, cycle_cv_max=0.30, min_cycles=6):
+    lo = sosfiltfilt(butter_bandpass_sos(fs, band[0], band[1], 4), sig)
+    env = np.abs(hilbert(lo))
+    low_bg = sosfiltfilt(butter_bandpass_sos(fs, 1.0, max(1.1, band[0] - 0.5), 4), sig)
+    high_bg = sosfiltfilt(butter_bandpass_sos(fs, min(0.45 * fs - 1.0, band[1] + 0.5), min(20.0, 0.45 * fs), 4), sig)
+    win = max(1, int(fs * 0.5))
+    num = uniform_filter1d(lo * lo, size=win, mode='nearest')
+    den = uniform_filter1d(low_bg * low_bg + high_bg * high_bg, size=win, mode='nearest') + 1e-12
+    ratio = num / den
+    env_mean = uniform_filter1d(env, size=win, mode='nearest')
+    env_var = uniform_filter1d(env * env, size=win, mode='nearest') - env_mean ** 2
+    env_cv = np.sqrt(np.maximum(0.0, env_var)) / (env_mean + 1e-12)
+    env_z = (env_mean - np.median(env_mean)) / (mad(env_mean, scale='normal') + 1e-9)
+    mask = (ratio > power_ratio) & (env_z > env_z_thresh) & (env_cv < env_cv_max)
+
+    events, in_evt, start = [], False, 0
+    for i, m in enumerate(mask):
+        if m and not in_evt:
+            in_evt, start = True, i
+        if in_evt and not m:
+            e = {"start": start / fs, "end": i / fs}
+            if events and e["start"] - events[-1]["end"] <= max_gap_s:
+                events[-1]["end"] = e["end"]
+            else:
+                events.append(e)
+            in_evt = False
+    if in_evt:
+        events.append({"start": start / fs, "end": len(sig) / fs})
+
+    kept = []
+    for e in events:
+        dur = e["end"] - e["start"]
+        if dur < min_duration_s:
+            continue
+        a, b = int(e["start"] * fs), int(e["end"] * fs)
+        seg = lo[a:b]
+        peaks, _ = find_peaks(seg, distance=max(1, int(fs / max(1.0, band[1]))))
+        if len(peaks) < min_cycles:
+            continue
+        isi = np.diff(peaks) / fs
+        if isi.size == 0:
+            continue
+        cv = float(np.std(isi) / (np.mean(isi) + 1e-12))
+        if cv > cycle_cv_max:
+            continue
+        e = dict(e)
+        e["dominant_hz"] = float(1.0 / (np.mean(isi) + 1e-12))
+        kept.append(e)
     return kept
 
 
@@ -1415,6 +1578,11 @@ def detect_seizures_llrms(sig, fs,
     x2  = sig * sig
     cs  = np.cumsum(np.r_[0.0, x2])
     RMS = np.sqrt((cs[w:] - cs[:-w]) / w)[::step]
+    m = min(len(starts), len(LL), len(RMS))
+    starts = starts[:m]
+    t0 = t0[:m]
+    LL = LL[:m]
+    RMS = RMS[:m]
 
     ll_z  = (LL  - np.median(LL))  / (mad(LL,  scale='normal') + 1e-9)
     rms_z = (RMS - np.median(RMS)) / (mad(RMS, scale='normal') + 1e-9)
@@ -1434,8 +1602,8 @@ def detect_seizures_llrms(sig, fs,
         p1_45, p70_100, p01_05 = band_power_fft(seg, fs, [(1,45),(70,100),(0.1,0.5)])
         hf_r[i] = p70_100 / (p1_45 + 1e-12)
         lf_r[i] = p01_05  / (p1_45 + 1e-12)
-        p4_30, p1_100 = band_power_fft(seg, fs, [(4,30),(1,100)])
-        prom[i] = p4_30 / (max(p1_100, 1e-12))
+        p4_30, p1_4, p30_100 = band_power_fft(seg, fs, [(4,30),(1,4),(30,100)])
+        prom[i] = p4_30 / (p1_4 + p30_100 + 1e-12)
         sent[i] = spectral_entropy_from_fft(seg, fs)
 
     ent_z    = (np.median(sent) - sent) / (mad(sent, scale='normal') + 1e-9)
@@ -1522,8 +1690,8 @@ def detect_seizures_spike_led(sig, fs, spike_times_rel,
         p1_45, p70_100, p01_05 = band_power_fft(seg, fs, [(1,45),(70,100),(0.1,0.5)])
         hf_r[i] = p70_100/(p1_45+1e-12)
         lf_r[i] = p01_05/(p1_45+1e-12)
-        p4_30, p1_100 = band_power_fft(seg, fs, [(4,30),(1,100)])
-        prom[i] = p4_30/max(p1_100,1e-12)
+        p4_30, p1_4, p30_100 = band_power_fft(seg, fs, [(4,30),(1,4),(30,100)])
+        prom[i] = p4_30/(p1_4 + p30_100 + 1e-12)
         sent[i] = spectral_entropy_from_fft(seg, fs)
 
     ent_z    = (np.median(sent) - sent) / (mad(sent, scale='normal') + 1e-9)
@@ -1578,6 +1746,120 @@ def detect_seizures_spike_led(sig, fs, spike_times_rel,
     return merged
 
 
+def detect_epileptiform_trains(sig, fs,
+                               win_s=1.0, hop_s=0.25,
+                               enter_z=3.6, exit_z=2.2,
+                               min_duration_s=8.0, close_s=1.0, merge_gap_s=10.0,
+                               amp_ratio_min=1.9, rhythm_prom_thr=1.05,
+                               min_peak_rate_hz=3.0, peak_z=3.2,
+                               occupancy_min=0.55):
+    """Detect sustained high-amplitude rhythmic spike/polyspike trains."""
+    n = len(sig)
+    w, step = max(1, int(round(win_s * fs))), max(1, int(round(hop_s * fs)))
+    if n < w + 2:
+        return []
+
+    starts = np.arange(0, n - w + 1, step)
+    t0_arr = starts / fs
+    pp = np.zeros(len(starts))
+    ll = np.zeros(len(starts))
+    rms = np.zeros(len(starts))
+    prom = np.zeros(len(starts))
+    entropy = np.zeros(len(starts))
+    lf_r = np.zeros(len(starts))
+    clip = np.zeros(len(starts), dtype=bool)
+    hkrt = np.zeros(len(starts), dtype=bool)
+
+    hi = min(70.0, 0.45 * fs)
+    if hi <= 10.0:
+        hf_z = np.zeros(n)
+    else:
+        hf = sosfiltfilt(butter_bandpass_sos(fs, 8.0, hi, 4), sig)
+        hf_abs = np.abs(hf)
+        hf_z = (hf_abs - np.median(hf_abs)) / (mad(hf_abs, scale='normal') + 1e-9)
+
+    peak_rate = np.zeros(len(starts))
+    for i, s0 in enumerate(starts):
+        seg = sig[s0:s0+w]
+        if len(seg) < w:
+            continue
+        p01, p99 = np.percentile(seg, [1, 99])
+        pp[i] = float(p99 - p01)
+        ll[i] = float(np.sum(np.abs(np.diff(seg))))
+        rms[i] = float(np.sqrt(np.mean(seg * seg)))
+        clip[i] = np.any(np.isclose(seg, p01, atol=1e-9)) or np.any(np.isclose(seg, p99, atol=1e-9))
+        hkrt[i] = kurtosis(seg, fisher=True, bias=False) > 14.0
+        p1_4, p4_30, p30_100, p01_05 = band_power_fft(seg, fs, [(1, 4), (4, 30), (30, min(100, 0.45 * fs)), (0.1, 0.5)])
+        prom[i] = p4_30 / (p1_4 + p30_100 + 1e-12)
+        lf_r[i] = p01_05 / (p1_4 + p4_30 + p30_100 + 1e-12)
+        entropy[i] = spectral_entropy_from_fft(seg, fs)
+        pk, _ = find_peaks(hf_z[s0:s0+w], height=peak_z, distance=max(1, int(round(fs / 45.0))))
+        peak_rate[i] = float(len(pk) / win_s)
+
+    pp_base = np.median(pp) + 1e-9
+    amp_ratio = pp / pp_base
+    ll_z = (ll - np.median(ll)) / (mad(ll, scale='normal') + 1e-9)
+    rms_z = (rms - np.median(rms)) / (mad(rms, scale='normal') + 1e-9)
+    ent_z = (np.median(entropy) - entropy) / (mad(entropy, scale='normal') + 1e-9)
+    z = np.maximum(ll_z, rms_z)
+
+    # Strong low-frequency drift and clipping are more likely movement/artifact than seizure.
+    artifact = (lf_r > 0.75) | clip | ((hkrt) & (amp_ratio > 8.0))
+    rhythmic = (prom >= rhythm_prom_thr) | (ent_z >= 0.10)
+    active = (amp_ratio >= amp_ratio_min) & (z >= exit_z) & rhythmic & (peak_rate >= min_peak_rate_hz) & (~artifact)
+
+    oh = max(1, int(round(close_s / hop_s)))
+    active = _close_gaps(active, oh)
+
+    mask = np.zeros(len(active), dtype=bool)
+    i = 0
+    while i < len(active):
+        if active[i] and z[i] >= enter_z:
+            start = i
+            i += 1
+            while i < len(active) and active[i]:
+                i += 1
+            mask[start:i] = True
+        else:
+            i += 1
+
+    events, in_evt, si = [], False, 0
+    for i, on in enumerate(mask):
+        if on and not in_evt:
+            in_evt, si = True, i
+        if in_evt and not on:
+            a, b = float(t0_arr[si]), float(t0_arr[i - 1] + win_s)
+            if b - a >= min_duration_s:
+                events.append((si, i, a, b))
+            in_evt = False
+    if in_evt:
+        a, b = float(t0_arr[si]), float(t0_arr[-1] + win_s)
+        if b - a >= min_duration_s:
+            events.append((si, len(mask), a, b))
+
+    kept = []
+    for si, ei, a, b in events:
+        occ = float(np.mean(active[si:ei])) if ei > si else 0.0
+        if occ < occupancy_min:
+            continue
+        kept.append({
+            "start": a,
+            "end": b,
+            "amp_ratio": float(np.nanmax(amp_ratio[si:ei])) if ei > si else np.nan,
+            "confidence": float(min(0.95, 0.60 + 0.05 * max(0.0, np.nanmax(z[si:ei]) - enter_z))),
+        })
+
+    merged = []
+    for e in sorted(kept, key=lambda d: d["start"]):
+        if not merged or e["start"] - merged[-1]["end"] > merge_gap_s:
+            merged.append(dict(e))
+        else:
+            merged[-1]["end"] = max(merged[-1]["end"], e["end"])
+            if np.isfinite(e.get("confidence", np.nan)):
+                merged[-1]["confidence"] = max(float(merged[-1].get("confidence", 0.0)), float(e["confidence"]))
+    return merged
+
+
 def merge_intervals(events, merge_gap_s):
     if not events: return []
     events = sorted(events, key=lambda e: e["start"])
@@ -1599,6 +1881,38 @@ def merge_spike_times(times, refr_s=0.02):
     return np.array(out, dtype=float)
 
 
+def filter_spikes_outside_events(spike_times, events, margin_s=0.25):
+    if len(spike_times) == 0 or not events:
+        return np.asarray(spike_times, dtype=float)
+    intervals = sorted(
+        (float(e["start"]) - margin_s, float(e["end"]) + margin_s)
+        for e in events
+    )
+    kept = []
+    j = 0
+    for ti in np.asarray(spike_times, dtype=float):
+        while j < len(intervals) and intervals[j][1] < ti:
+            j += 1
+        if j < len(intervals) and intervals[j][0] <= ti <= intervals[j][1]:
+            continue
+        kept.append(float(ti))
+    return np.asarray(kept, dtype=float)
+
+
+def filter_events_outside_events(candidate_events, blocker_events, margin_s=0.0):
+    if not candidate_events or not blocker_events:
+        return list(candidate_events or [])
+    blockers = sorted((float(e["start"]) - margin_s, float(e["end"]) + margin_s)
+                      for e in blocker_events)
+    kept = []
+    for e in candidate_events:
+        a, b = float(e["start"]), float(e["end"])
+        overlaps = any(a <= bb and b >= ba for ba, bb in blockers)
+        if not overlaps:
+            kept.append(e)
+    return kept
+
+
 def bin_counts(spike_ts, swd_evts, sz_evts, bin_s, t0, t1):
     edges = np.arange(t0, t1 + bin_s, bin_s)
     if edges[-1] < t1:
@@ -1614,6 +1928,75 @@ def bin_counts(spike_ts, swd_evts, sz_evts, bin_s, t0, t1):
     return pd.DataFrame(rows)
 
 
+def _read_text_waveform_metadata(file_path):
+    meta = {}
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for _ in range(12):
+                line = f.readline()
+                if not line:
+                    break
+                parts = [p.strip() for p in line.rstrip("\n").split("\t")]
+                if parts and parts[0].lower() == "count" and len(parts) > 1:
+                    try:
+                        meta["count"] = int(float(parts[1]))
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return meta
+
+
+def iter_waveform_tabular_chunks(file_path, chunk_rows=600000):
+    path = pathlib.Path(file_path)
+    ext = path.suffix.lower()
+    if ext not in [".tsv", ".txt", ".csv"]:
+        t, y = load_waveform_tabular(file_path)
+        yield t, y
+        return
+
+    sep = "\t" if ext in [".tsv", ".txt"] else ","
+    reader = pd.read_csv(
+        file_path,
+        sep=sep,
+        header=None,
+        skiprows=7,
+        usecols=[3, 4],
+        chunksize=int(chunk_rows),
+        engine="c",
+        on_bad_lines="skip",
+    )
+    for df in reader:
+        t = pd.to_numeric(
+            df.iloc[:, 0].astype(str).str.strip().str.replace(r"[^0-9eE+\-\.]", "", regex=True),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        y = pd.to_numeric(
+            df.iloc[:, 1].astype(str).str.strip().str.replace(r"[^0-9eE+\-\.]", "", regex=True),
+            errors="coerce",
+        ).to_numpy(dtype=float)
+        valid = np.isfinite(t) & np.isfinite(y)
+        if np.any(valid):
+            yield t[valid], y[valid]
+
+
+def _events_from_eeg_detection(spike_times, swd_events, sz_events):
+    rows = []
+    for ti in spike_times:
+        rows.append({"Type": "Spike", "Start_s": float(ti), "End_s": float(ti),
+                     "Duration_s": 0.0, "Confidence": np.nan})
+    for e in swd_events:
+        rows.append({"Type": "SWD", "Start_s": float(e["start"]), "End_s": float(e["end"]),
+                     "Duration_s": float(e["end"] - e["start"]),
+                     "Confidence": float(e.get("confidence", np.nan))})
+    for e in sz_events:
+        rows.append({"Type": "Seizure", "Start_s": float(e["start"]), "End_s": float(e["end"]),
+                     "Duration_s": float(e["end"] - e["start"]),
+                     "Confidence": float(e.get("confidence", np.nan))})
+    cols = ["Type", "Start_s", "End_s", "Duration_s", "Confidence"]
+    return pd.DataFrame(sorted(rows, key=lambda r: (r["Start_s"], r["Type"])), columns=cols)
+
+
 def analyze_eeg(t, y, fs, bin_s=3600.0, debug_plots=False):
     sig = eeg_preprocess(y, fs)
     sig_spk, fs_spk = decimate_to(sig, fs, 500)
@@ -1621,26 +2004,33 @@ def analyze_eeg(t, y, fs, bin_s=3600.0, debug_plots=False):
     sig_sz,  fs_sz  = decimate_to(sig, fs, 250)
     t0, t1 = float(t[0]), float(t[-1])
 
-    spk_params = dict(z_thresh=5.6, width_ms=(12,80), refr_ms=22,
-                      slope_thresh=3.0, curv_thresh=2.0, rtob_frac=0.25,
-                      ampz_thresh=4.2, ampz_win_s=1.5,
-                      biphasic_mode='soft', bip_win_ms=25.0, bip_ratio_min=0.35)
+    spk_params = dict(z_thresh=4.8, width_ms=(8,100), refr_ms=50,
+                      slope_thresh=1.4, curv_thresh=1.2, rtob_frac=1.5,
+                      ampz_thresh=7.0, ampz_win_s=3.0, hf_lf_ratio_min=0.05,
+                      biphasic_mode='soft', bip_win_ms=30.0, bip_ratio_min=0.10)
     spikes_raw  = detect_spikes(sig_spk, fs_spk, **spk_params)
     spike_times = np.array([t0 + s["idx"]/fs_spk for s in spikes_raw], dtype=float)
     spike_times = merge_spike_times(spike_times.tolist(), refr_s=0.02)
 
-    swd_raw    = detect_swd(sig_swd, fs_swd)
+    swd_raw = detect_swd(sig_swd, fs_swd)
     swd_events = [{"start": t0+e["start"], "end": t0+e["end"],
                    "type": "SWD", "confidence": 0.85} for e in swd_raw]
+    sz_swd = []
 
     rel_spikes  = (spike_times - t0).tolist()
     sz_spike    = detect_seizures_spike_led(sig_sz, fs_sz, rel_spikes)
     sz_llrms    = detect_seizures_llrms(sig_sz, fs_sz)
+    sz_train    = detect_epileptiform_trains(sig_sz, fs_sz)
     sz_all      = ([{"start": t0+e["start"], "end": t0+e["end"],
                      "type": "Seizure", "confidence": 0.90} for e in sz_spike]
                  + [{"start": t0+e["start"], "end": t0+e["end"],
-                     "type": "Seizure", "confidence": 0.75} for e in sz_llrms])
-    sz_events   = merge_intervals(sz_all, merge_gap_s=12.0)
+                     "type": "Seizure", "confidence": 0.75} for e in sz_llrms]
+                 + [{"start": t0+e["start"], "end": t0+e["end"],
+                     "type": "Seizure", "confidence": float(e.get("confidence", 0.82))} for e in sz_train]
+                 + sz_swd)
+    sz_events   = merge_intervals(sz_all, merge_gap_s=10.0)
+    swd_events  = filter_events_outside_events(swd_events, sz_events, margin_s=0.25)
+    spike_times = filter_spikes_outside_events(spike_times, swd_events + sz_events, margin_s=0.25)
 
     summary_df = bin_counts(spike_times, swd_events, sz_events, bin_s, t0, t1)
 
@@ -1667,6 +2057,11 @@ def analyze_eeg(t, y, fs, bin_s=3600.0, debug_plots=False):
         "bin_size_s":           float(bin_s),
         "preprocess":           "rolling-median detrend + 50/100 Hz notch + 0.5-100 Hz bandpass",
         "detector_fs":          "Spikes 500 Hz | SWD 200 Hz | Seizure 250 Hz",
+        "eeg_detection_profile": "mouse_literature_guided_v6",
+        "eeg_swd_criteria":      "5-9 Hz, >=4 cycles, >=1.8x local baseline, harmonic gate",
+        "eeg_seizure_criteria":  ">=8 s dense high-amplitude rhythmic/evolving spike trains; reviewed EEG corrections auto-applied by source file",
+        "eeg_spike_artifact_filter": "reject post-tail artifacts when 40-80 ms post/spike >0.30 and biphasic ratio <0.20",
+        "eeg_spike_criteria":    "14-70 Hz transient, amp z >=7.0, width 8-100 ms, post-tail artifact filter",
     }
 
     if debug_plots and len(events_df) > 0:
@@ -1683,6 +2078,152 @@ def analyze_eeg(t, y, fs, bin_s=3600.0, debug_plots=False):
             plt.xlabel("Time (s)"); plt.ylabel("EEG (a.u.)")
             plt.grid(alpha=0.2); plt.tight_layout(); plt.show()
 
+    return summary_df, events_df, meta
+
+
+def analyze_eeg_file(
+    file_path,
+    bin_s=3600.0,
+    debug_plots=False,
+    force_fs=None,
+    progress_callback=None,
+    chunk_s=180.0,
+    overlap_s=10.0,
+    streaming_threshold_mb=128.0,
+):
+    path = pathlib.Path(file_path)
+    ext = path.suffix.lower()
+    size_mb = os.path.getsize(file_path) / 1024 / 1024
+
+    if ext in [".xlsx", ".xls"] or size_mb < float(streaming_threshold_mb):
+        if progress_callback:
+            progress_callback(8, "EEG: loading file")
+        t, y = load_waveform_tabular(file_path)
+        if force_fs is not None:
+            t, y, fs = ensure_uniform_sampling(t, y, fs_target=float(force_fs))
+        else:
+            t, y, fs = ensure_uniform_sampling(t, y)
+        summary_df, events_df, meta = analyze_eeg(t, y, fs, bin_s=bin_s, debug_plots=debug_plots)
+        meta["source_file"] = os.path.abspath(file_path)
+        events_df, applied = apply_eeg_saved_corrections(file_path, events_df, t0=float(t[0]), t1=float(t[-1]))
+        if applied:
+            summary_df = recompute_eeg_bins_from_events(events_df, float(bin_s), t0=float(t[0]), t1=float(t[-1]))
+            meta["eeg_saved_corrections_applied"] = int(applied)
+            meta = update_eeg_meta_from_events(meta, events_df, summary_df)
+        return summary_df, events_df, meta
+
+    text_meta = _read_text_waveform_metadata(file_path)
+    total_rows = int(text_meta.get("count", 0) or 0)
+    chunk_rows = int(max(50000, round((force_fs if force_fs else 2000.0) * chunk_s)))
+
+    all_spikes = []
+    all_swd = []
+    all_sz = []
+    first_t = None
+    last_t = None
+    fs_used = float(force_fs) if force_fs is not None else None
+    prev_t = np.array([], dtype=float)
+    prev_y = np.array([], dtype=float)
+    processed = 0
+    chunks = 0
+    skipped_chunks = 0
+
+    for t_new, y_new in iter_waveform_tabular_chunks(file_path, chunk_rows=chunk_rows):
+        chunks += 1
+        processed += len(t_new)
+        if len(t_new) < 3:
+            continue
+        if first_t is None:
+            first_t = float(t_new[0])
+        last_t = float(t_new[-1])
+
+        core_start = float(t_new[0])
+        core_end = float(t_new[-1])
+        if prev_t.size:
+            t_chunk = np.concatenate([prev_t, t_new])
+            y_chunk = np.concatenate([prev_y, y_new])
+        else:
+            t_chunk, y_chunk = t_new, y_new
+
+        if fs_used is not None:
+            t_u, y_u, fs = ensure_uniform_sampling(t_chunk, y_chunk, fs_target=float(fs_used))
+        else:
+            t_u, y_u, fs = ensure_uniform_sampling(t_chunk, y_chunk)
+            fs_used = float(fs)
+
+        try:
+            _, events_df, _ = analyze_eeg(t_u, y_u, fs, bin_s=bin_s, debug_plots=False)
+        except Exception as exc:
+            skipped_chunks += 1
+            if progress_callback:
+                progress_callback(10, f"EEG: skipped chunk {chunks} ({exc})")
+            continue
+        if len(events_df):
+            for _, row in events_df.iterrows():
+                typ = str(row["Type"])
+                start = float(row["Start_s"])
+                end = float(row["End_s"])
+                if typ == "Spike":
+                    if core_start <= start < core_end:
+                        all_spikes.append(start)
+                elif end >= core_start and start < core_end:
+                    rec = {"start": max(start, core_start), "end": min(end, core_end),
+                           "type": typ, "confidence": float(row.get("Confidence", np.nan))}
+                    if typ == "SWD":
+                        all_swd.append(rec)
+                    elif typ == "Seizure":
+                        all_sz.append(rec)
+
+        keep_from = core_end - float(overlap_s)
+        keep = t_new >= keep_from
+        prev_t = t_new[keep].copy()
+        prev_y = y_new[keep].copy()
+
+        if progress_callback:
+            if total_rows > 0:
+                pct = 5 + 85 * min(1.0, processed / total_rows)
+                progress_callback(pct, f"EEG: scanned {processed:,}/{total_rows:,} samples")
+            else:
+                progress_callback(10, f"EEG: scanned {processed:,} samples")
+
+    if first_t is None or last_t is None:
+        raise ValueError("No valid EEG samples found.")
+
+    spike_times = merge_spike_times(all_spikes, refr_s=0.02)
+    swd_events = merge_intervals(all_swd, merge_gap_s=0.5)
+    sz_events = merge_intervals(all_sz, merge_gap_s=10.0)
+    swd_events = filter_events_outside_events(swd_events, sz_events, margin_s=0.25)
+
+    summary_df = bin_counts(spike_times, swd_events, sz_events, bin_s, first_t, last_t)
+    events_df = _events_from_eeg_detection(spike_times, swd_events, sz_events)
+    meta = {
+        "fs_Hz": float(fs_used) if fs_used is not None else np.nan,
+        "recording_duration_s": float(last_t - first_t),
+        "total_spikes": int(len(spike_times)),
+        "total_SWDs": int(len(swd_events)),
+        "total_seizures": int(len(sz_events)),
+        "bin_size_s": float(bin_s),
+        "preprocess": "streamed rolling-median detrend + 50/100 Hz notch + 0.5-100 Hz bandpass",
+        "detector_fs": "Spikes 500 Hz | SWD 200 Hz | Seizure 250 Hz",
+        "eeg_detection_profile": "mouse_literature_guided_v6",
+        "eeg_swd_criteria": "5-9 Hz, >=4 cycles, >=1.8x local baseline, harmonic gate",
+        "eeg_seizure_criteria": ">=8 s dense high-amplitude rhythmic/evolving spike trains; reviewed EEG corrections auto-applied by source file",
+        "eeg_spike_artifact_filter": "reject post-tail artifacts when 40-80 ms post/spike >0.30 and biphasic ratio <0.20",
+        "eeg_spike_criteria": "14-70 Hz transient, amp z >=7.0, width 8-100 ms, post-tail artifact filter",
+        "source_file": os.path.abspath(file_path),
+        "streaming": True,
+        "chunk_s": float(chunk_s),
+        "overlap_s": float(overlap_s),
+        "chunks_processed": int(chunks),
+        "chunks_skipped": int(skipped_chunks),
+    }
+    events_df, applied = apply_eeg_saved_corrections(file_path, events_df, t0=float(first_t), t1=float(last_t))
+    if applied:
+        summary_df = recompute_eeg_bins_from_events(events_df, float(bin_s), t0=float(first_t), t1=float(last_t))
+        meta["eeg_saved_corrections_applied"] = int(applied)
+        meta = update_eeg_meta_from_events(meta, events_df, summary_df)
+    if progress_callback:
+        progress_callback(95, "EEG: finalizing events")
     return summary_df, events_df, meta
 
 
@@ -1730,11 +2271,777 @@ def export_ecg_excel(save_path, beat_rows, meta):
     persist_workbook_corrections(save_path, str(meta.get("source_file", "")), df)
 
 
-def export_eeg_excel(save_path, summary_df, events_df, meta):
+def export_eeg_excel(save_path, summary_df, events_df, meta, benchmark_df=None):
+    events_df = dedupe_eeg_events(events_df)
+    meta = update_eeg_meta_from_events(meta, events_df, summary_df)
+    meta.setdefault("generated_at", now_iso())
+    meta.setdefault("source_file", "")
     with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
         summary_df.to_excel(writer, index=False, sheet_name="EEG_Bins")
         events_df.to_excel(writer,  index=False, sheet_name="EEG_Events")
+        if benchmark_df is not None:
+            pd.DataFrame(benchmark_df).to_excel(writer, index=False, sheet_name="EEG_Benchmark")
         pd.DataFrame([meta]).to_excel(writer, index=False, sheet_name="Meta")
+    persist_eeg_workbook_corrections(save_path, str(meta.get("source_file", "")), events_df)
+
+
+def parse_eeg_manual_counts(workbook_path, sheet_name="Baseline"):
+    raw = pd.read_excel(workbook_path, sheet_name=sheet_name, header=None)
+    header_idx = None
+    for i, row in raw.iterrows():
+        vals = [str(v).strip().lower() for v in row.tolist()]
+        if "time" in vals and any("spike" in v for v in vals):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError(f"Could not find manual EEG count header row in sheet '{sheet_name}'.")
+
+    header = [str(v).strip().lower() for v in raw.iloc[header_idx].tolist()]
+    cols = {}
+    for idx, name in enumerate(header):
+        if name == "time":
+            cols["Time"] = idx
+        elif "spike" in name:
+            cols["Spike_Count"] = idx
+        elif "swd" in name:
+            cols["SWD_Count"] = idx
+        elif "seiz" in name:
+            cols["Seizure_Count"] = idx
+
+    required = ["Time", "Spike_Count", "SWD_Count", "Seizure_Count"]
+    missing = [c for c in required if c not in cols]
+    if missing:
+        raise ValueError(f"Manual EEG workbook is missing columns: {', '.join(missing)}")
+
+    data = pd.DataFrame({
+        name: raw.iloc[header_idx + 1:, col].values
+        for name, col in cols.items()
+    })
+    data = data[pd.notna(data["Time"])].copy()
+    time_txt = data["Time"].astype(str).str.strip()
+    data = data[~time_txt.str.upper().isin({"AVERAGE", "TOTAL", "MEAN"})].copy()
+
+    for col in ["Spike_Count", "SWD_Count", "Seizure_Count"]:
+        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0).astype(int)
+
+    data["Hour_Index"] = np.arange(1, len(data) + 1, dtype=int)
+    data["Bin_Start_s"] = (data["Hour_Index"] - 1) * 3600.0
+    data["Bin_End_s"] = data["Hour_Index"] * 3600.0
+    data["Manual_Time"] = data["Time"].astype(str)
+    return data[[
+        "Hour_Index", "Manual_Time", "Bin_Start_s", "Bin_End_s",
+        "Spike_Count", "SWD_Count", "Seizure_Count",
+    ]].reset_index(drop=True)
+
+
+def compare_eeg_counts_to_manual(summary_df, manual_df):
+    prog = pd.DataFrame(summary_df).reset_index(drop=True).copy()
+    manual = pd.DataFrame(manual_df).reset_index(drop=True).copy()
+    count_cols = ["Spike_Count", "SWD_Count", "Seizure_Count"]
+    for col in count_cols:
+        if col not in prog.columns:
+            prog[col] = 0
+        if col not in manual.columns:
+            manual[col] = 0
+        prog[col] = pd.to_numeric(prog[col], errors="coerce").fillna(0).astype(int)
+        manual[col] = pd.to_numeric(manual[col], errors="coerce").fillna(0).astype(int)
+
+    n = min(len(prog), len(manual))
+    rows = []
+    for i in range(n):
+        row = {
+            "Bin_Index": int(i + 1),
+            "Manual_Time": manual.loc[i, "Manual_Time"] if "Manual_Time" in manual.columns else "",
+            "Bin_Start_s": float(prog.loc[i, "Bin_Start_s"]) if "Bin_Start_s" in prog.columns else float(i * 3600),
+            "Bin_End_s": float(prog.loc[i, "Bin_End_s"]) if "Bin_End_s" in prog.columns else float((i + 1) * 3600),
+        }
+        for col in count_cols:
+            event = col.replace("_Count", "")
+            p = int(prog.loc[i, col])
+            m = int(manual.loc[i, col])
+            row[f"Program_{event}"] = p
+            row[f"Manual_{event}"] = m
+            row[f"Abs_Error_{event}"] = abs(p - m)
+        rows.append(row)
+    benchmark_df = pd.DataFrame(rows)
+
+    meta = {
+        "eeg_benchmark_bins_compared": int(n),
+        "eeg_benchmark_manual_rows": int(len(manual)),
+        "eeg_benchmark_program_rows": int(len(prog)),
+    }
+    for col in count_cols:
+        event = col.replace("_Count", "")
+        p_total = int(prog.head(n)[col].sum()) if n else 0
+        m_total = int(manual.head(n)[col].sum()) if n else 0
+        meta[f"eeg_benchmark_program_{event.lower()}s"] = p_total
+        meta[f"eeg_benchmark_manual_{event.lower()}s"] = m_total
+        meta[f"eeg_benchmark_abs_error_{event.lower()}s"] = abs(p_total - m_total)
+    if n:
+        err_cols = [c for c in benchmark_df.columns if c.startswith("Abs_Error_")]
+        meta["eeg_benchmark_total_abs_error"] = int(benchmark_df[err_cols].sum().sum())
+        meta["eeg_benchmark_exact_bin_match_ratio"] = float((benchmark_df[err_cols].sum(axis=1) == 0).mean())
+    else:
+        meta["eeg_benchmark_total_abs_error"] = 0
+        meta["eeg_benchmark_exact_bin_match_ratio"] = np.nan
+    return benchmark_df, meta
+
+
+def _normalize_eeg_event_type(value):
+    txt = str(value).strip()
+    low = txt.lower()
+    if low in {"swd", "swds", "spike-wave discharge", "spike wave discharge"}:
+        return "SWD"
+    if low in {"seizure", "seizures"}:
+        return "Seizure"
+    if low in {"spike", "spikes"}:
+        return "Spike"
+    return "Spike"
+
+
+def ensure_eeg_events_schema(events_df):
+    df = pd.DataFrame(events_df).copy()
+    if df.empty:
+        df = pd.DataFrame(columns=EEG_EVENT_COLUMNS)
+    if "Event_Index" not in df.columns:
+        df["Event_Index"] = np.arange(len(df), dtype=int)
+    df["Event_Index"] = pd.to_numeric(df["Event_Index"], errors="coerce")
+    if df["Event_Index"].isna().any():
+        df["Event_Index"] = np.arange(len(df), dtype=int)
+    df["Event_Index"] = df["Event_Index"].astype(int)
+
+    if "Type" not in df.columns:
+        df["Type"] = "Spike"
+    df["Type"] = df["Type"].apply(_normalize_eeg_event_type)
+
+    for col in ["Start_s", "End_s", "Duration_s", "Confidence"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["Start_s"] = df["Start_s"].fillna(0.0)
+    df["End_s"] = df["End_s"].fillna(df["Start_s"])
+    df.loc[df["Type"] == "Spike", "End_s"] = df.loc[df["Type"] == "Spike", "Start_s"]
+    bad_end = df["End_s"] < df["Start_s"]
+    df.loc[bad_end, "End_s"] = df.loc[bad_end, "Start_s"]
+    df["Duration_s"] = (df["End_s"] - df["Start_s"]).clip(lower=0.0)
+
+    for col in ["Is_Corrected", "Is_Deleted"]:
+        if col not in df.columns:
+            df[col] = False
+        df[col] = df[col].apply(_to_bool)
+    for col in ["Corrected_At", "Correction_Source", "Correction_Notes"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str)
+
+    df.sort_values(["Start_s", "Event_Index"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    trailing = [c for c in df.columns if c not in EEG_EVENT_COLUMNS]
+    return df[EEG_EVENT_COLUMNS + trailing]
+
+
+def dedupe_eeg_events(events_df, tol_s=0.001):
+    df = ensure_eeg_events_schema(events_df)
+    if len(df) <= 1:
+        return df
+    work = df.copy()
+    work["_type_key"] = work["Type"].map(_normalize_eeg_event_type)
+    work["_start_key"] = (pd.to_numeric(work["Start_s"], errors="coerce") / tol_s).round().astype("Int64")
+    work["_end_key"] = (pd.to_numeric(work["End_s"], errors="coerce") / tol_s).round().astype("Int64")
+    keep_indices = []
+    for _, group in work.groupby(["_type_key", "_start_key", "_end_key"], dropna=False, sort=False):
+        if len(group) == 1:
+            keep_indices.append(group.index[0])
+            continue
+        scored = group.assign(
+            _active=(~group["Is_Deleted"].apply(_to_bool)).astype(int),
+            _corrected=group["Is_Corrected"].apply(_to_bool).astype(int),
+            _note_len=group["Correction_Notes"].fillna("").astype(str).str.strip().str.len(),
+        ).sort_values(["_active", "_corrected", "_note_len", "Event_Index"], ascending=[False, False, False, False])
+        keep_idx = scored.index[0]
+        notes = []
+        for note in group["Correction_Notes"].fillna("").astype(str):
+            note = note.strip()
+            if note and note not in notes:
+                notes.append(note)
+        if notes:
+            df.at[keep_idx, "Correction_Notes"] = "; ".join(notes)
+            df.at[keep_idx, "Is_Corrected"] = True
+            df.at[keep_idx, "Corrected_At"] = now_iso()
+            df.at[keep_idx, "Correction_Source"] = "manual_review_dedupe"
+        keep_indices.append(keep_idx)
+    out = df.loc[sorted(keep_indices)].copy()
+    out.sort_values(["Start_s", "Event_Index"], inplace=True)
+    out.reset_index(drop=True, inplace=True)
+    return ensure_eeg_events_schema(out)
+
+
+def _default_eeg_correction_store():
+    return {"version": 1, "updated_at": now_iso(), "sources": {}}
+
+
+def _eeg_source_key(source_file):
+    if not source_file:
+        return ""
+    return os.path.normcase(os.path.abspath(str(source_file)))
+
+
+def load_eeg_correction_store(path=EEG_CORRECTION_STORE_FILE):
+    if not os.path.exists(path):
+        return _default_eeg_correction_store()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return _default_eeg_correction_store()
+        data.setdefault("version", 1)
+        data.setdefault("updated_at", now_iso())
+        data.setdefault("sources", {})
+        if not isinstance(data["sources"], dict):
+            data["sources"] = {}
+        return data
+    except Exception:
+        return _default_eeg_correction_store()
+
+
+def save_eeg_correction_store(store, path=EEG_CORRECTION_STORE_FILE):
+    out = _default_eeg_correction_store()
+    if isinstance(store, dict):
+        out.update(store)
+    out["version"] = 1
+    out["updated_at"] = now_iso()
+    out["sources"] = out.get("sources", {}) if isinstance(out.get("sources"), dict) else {}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+
+
+def persist_eeg_workbook_corrections(workbook_path, source_file, events_df):
+    source_key = _eeg_source_key(source_file)
+    if not source_key:
+        return 0
+    df = ensure_eeg_events_schema(events_df)
+    if df.empty:
+        return 0
+    source_text = df["Correction_Source"].fillna("").astype(str)
+    note_text = df["Correction_Notes"].fillna("").astype(str).str.strip()
+    corrected_mask = (
+        df["Is_Corrected"].apply(_to_bool)
+        | df["Is_Deleted"].apply(_to_bool)
+        | source_text.str.contains("manual_review", case=False, regex=False)
+        | (note_text != "")
+    )
+    corrected = df[corrected_mask].copy()
+    if corrected.empty:
+        return 0
+
+    rows = []
+    for _, row in corrected.iterrows():
+        rows.append({
+            "Event_Index": int(row.get("Event_Index", len(rows))),
+            "Type": _normalize_eeg_event_type(row.get("Type", "Spike")),
+            "Start_s": float(row.get("Start_s", 0.0)),
+            "End_s": float(row.get("End_s", row.get("Start_s", 0.0))),
+            "Duration_s": float(row.get("Duration_s", 0.0)),
+            "Confidence": None if pd.isna(row.get("Confidence", np.nan)) else float(row.get("Confidence")),
+            "Is_Deleted": bool(_to_bool(row.get("Is_Deleted", False))),
+            "Correction_Notes": str(row.get("Correction_Notes", "") or ""),
+            "Correction_Source": str(row.get("Correction_Source", "manual_review") or "manual_review"),
+            "Corrected_At": str(row.get("Corrected_At", "") or now_iso()),
+        })
+
+    store = load_eeg_correction_store()
+    store.setdefault("sources", {})
+    store["sources"][source_key] = {
+        "source_file": os.path.abspath(str(source_file)),
+        "workbook_path": os.path.abspath(str(workbook_path)) if workbook_path else "",
+        "saved_at": now_iso(),
+        "events": rows,
+    }
+    save_eeg_correction_store(store)
+    return len(rows)
+
+
+def _match_eeg_correction_event(df, corr):
+    if df.empty:
+        return None
+    typ = _normalize_eeg_event_type(corr.get("Type", "Spike"))
+    start = float(corr.get("Start_s", 0.0))
+    end = float(corr.get("End_s", start))
+    candidates = df[df["Type"].map(_normalize_eeg_event_type) == typ]
+    if candidates.empty:
+        return None
+    best_idx, best_score = None, -1.0
+    for idx, row in candidates.iterrows():
+        a = float(row.get("Start_s", 0.0))
+        b = float(row.get("End_s", a))
+        if typ == "Spike":
+            dist = abs(a - start)
+            if dist <= 0.25:
+                score = 1.0 - dist / 0.25
+            else:
+                continue
+        else:
+            overlap = max(0.0, min(end, b) - max(start, a))
+            min_dur = max(1e-9, min(max(0.0, end - start), max(0.0, b - a)))
+            score = overlap / min_dur if min_dur > 0 else 0.0
+            if overlap < 1.0 and abs(a - start) > 5.0:
+                continue
+        if score > best_score:
+            best_idx, best_score = idx, score
+    return best_idx
+
+
+def apply_eeg_saved_corrections(source_file, events_df, t0=None, t1=None):
+    source_key = _eeg_source_key(source_file)
+    if not source_key:
+        return ensure_eeg_events_schema(events_df), 0
+    store = load_eeg_correction_store()
+    rec = (store.get("sources", {}) or {}).get(source_key)
+    if not isinstance(rec, dict):
+        return ensure_eeg_events_schema(events_df), 0
+    corrections = rec.get("events", [])
+    if not isinstance(corrections, list) or not corrections:
+        return ensure_eeg_events_schema(events_df), 0
+
+    df = ensure_eeg_events_schema(events_df)
+    applied = 0
+    next_idx = int(df["Event_Index"].max() + 1) if len(df) else 0
+    for corr in corrections:
+        if not isinstance(corr, dict):
+            continue
+        typ = _normalize_eeg_event_type(corr.get("Type", "Spike"))
+        start = float(corr.get("Start_s", 0.0))
+        end = float(corr.get("End_s", start))
+        if t0 is not None and end < float(t0) - 1.0:
+            continue
+        if t1 is not None and start > float(t1) + 1.0:
+            continue
+        if typ == "Spike":
+            end = start
+        if end < start:
+            start, end = end, start
+        deleted = bool(_to_bool(corr.get("Is_Deleted", False)))
+        idx = _match_eeg_correction_event(df, corr)
+        payload = {
+            "Type": typ,
+            "Start_s": start,
+            "End_s": end,
+            "Duration_s": max(0.0, end - start),
+            "Confidence": np.nan if corr.get("Confidence", None) is None else float(corr.get("Confidence")),
+            "Is_Corrected": True,
+            "Is_Deleted": deleted,
+            "Corrected_At": str(corr.get("Corrected_At", "") or now_iso()),
+            "Correction_Source": "saved_eeg_correction",
+            "Correction_Notes": str(corr.get("Correction_Notes", "") or ""),
+        }
+        if idx is None:
+            payload["Event_Index"] = next_idx
+            next_idx += 1
+            df = pd.concat([df, pd.DataFrame([payload])], ignore_index=True)
+        else:
+            for col, val in payload.items():
+                df.at[idx, col] = val
+        applied += 1
+    return dedupe_eeg_events(df), applied
+
+
+def active_eeg_events(events_df):
+    df = ensure_eeg_events_schema(events_df)
+    return df[~df["Is_Deleted"].apply(_to_bool)].copy()
+
+
+def recompute_eeg_bins_from_events(events_df, bin_s, t0=0.0, t1=None):
+    active = active_eeg_events(events_df)
+    if t1 is None:
+        if len(active):
+            t1 = float(max(active["End_s"].max(), active["Start_s"].max()))
+        else:
+            t1 = float(bin_s)
+    spike_ts = active.loc[active["Type"] == "Spike", "Start_s"].to_numpy(dtype=float)
+    swd_evts = [
+        {"start": float(r["Start_s"]), "end": float(r["End_s"])}
+        for _, r in active.loc[active["Type"] == "SWD"].iterrows()
+    ]
+    sz_evts = [
+        {"start": float(r["Start_s"]), "end": float(r["End_s"])}
+        for _, r in active.loc[active["Type"] == "Seizure"].iterrows()
+    ]
+    return bin_counts(spike_ts, swd_evts, sz_evts, float(bin_s), float(t0), float(t1))
+
+
+def update_eeg_meta_from_events(meta, events_df, summary_df=None):
+    meta = dict(meta or {})
+    active = active_eeg_events(events_df)
+    meta["total_spikes"] = int((active["Type"] == "Spike").sum())
+    meta["total_SWDs"] = int((active["Type"] == "SWD").sum())
+    meta["total_seizures"] = int((active["Type"] == "Seizure").sum())
+    if summary_df is not None and len(summary_df):
+        meta["bin_size_s"] = float(pd.to_numeric(summary_df["Bin_End_s"] - summary_df["Bin_Start_s"],
+                                                errors="coerce").dropna().median())
+        meta["recording_duration_s"] = float(pd.to_numeric(summary_df["Bin_End_s"], errors="coerce").max()
+                                             - pd.to_numeric(summary_df["Bin_Start_s"], errors="coerce").min())
+    return meta
+
+
+def load_eeg_workbook(workbook_path):
+    summary_df = pd.read_excel(workbook_path, sheet_name="EEG_Bins")
+    try:
+        events_df = pd.read_excel(workbook_path, sheet_name="EEG_Events")
+    except Exception:
+        events_df = pd.DataFrame(columns=["Type", "Start_s", "End_s", "Duration_s", "Confidence"])
+    try:
+        meta_df = pd.read_excel(workbook_path, sheet_name="Meta")
+        meta = meta_df.iloc[0].to_dict() if len(meta_df) else {}
+    except Exception:
+        meta = {}
+    events_df = ensure_eeg_events_schema(events_df)
+    return summary_df, events_df, meta
+
+
+def _safe_filename(text, max_len=90):
+    keep = []
+    for ch in str(text):
+        if ch.isalnum() or ch in ("-", "_", "."):
+            keep.append(ch)
+        elif ch in (" ", "\t"):
+            keep.append("_")
+    name = "".join(keep).strip("._")
+    return (name[:max_len] or "plot")
+
+
+def _read_text_waveform_layout(file_path):
+    layout = {
+        "header_rows": 7,
+        "data_offset": None,
+        "line_len": None,
+        "first_t": 0.0,
+    }
+    offsets = []
+    lines = []
+    with open(file_path, "rb") as f:
+        for _ in range(20):
+            off = f.tell()
+            line = f.readline()
+            if not line:
+                break
+            offsets.append(off)
+            lines.append(line)
+    for i, line in enumerate(lines):
+        low = line.lower()
+        if b"time from start" in low:
+            layout["header_rows"] = i + 1
+            if i + 1 < len(lines):
+                layout["data_offset"] = offsets[i + 1]
+            break
+    if layout["data_offset"] is None and len(lines) > layout["header_rows"]:
+        layout["data_offset"] = offsets[layout["header_rows"]]
+
+    data_idx = layout["header_rows"]
+    if data_idx < len(lines):
+        layout["line_len"] = len(lines[data_idx])
+        try:
+            parts = lines[data_idx].split(b"\t")
+            layout["first_t"] = float(parts[3])
+        except Exception:
+            layout["first_t"] = 0.0
+    if data_idx + 1 < len(lines) and len(lines[data_idx + 1]) != layout["line_len"]:
+        layout["line_len"] = None
+    return layout
+
+
+def read_waveform_window(file_path, start_s, end_s, fs_hint=None):
+    start_s = max(0.0, float(start_s))
+    end_s = max(start_s + 1e-6, float(end_s))
+    path = pathlib.Path(file_path)
+    ext = path.suffix.lower()
+
+    if ext not in [".tsv", ".txt", ".csv"]:
+        t, y = load_waveform_tabular(file_path)
+        keep = (t >= start_s) & (t <= end_s)
+        return t[keep], y[keep]
+
+    sep = "\t" if ext in [".tsv", ".txt"] else ","
+    fs_hint = float(fs_hint) if fs_hint is not None and np.isfinite(float(fs_hint)) else None
+    if fs_hint:
+        layout = _read_text_waveform_layout(file_path)
+        if layout["data_offset"] is not None and layout["line_len"]:
+            first_t = float(layout.get("first_t", 0.0))
+            start_row = max(0, int(np.floor((start_s - first_t) * fs_hint)))
+            n_rows = max(1, int(np.ceil((end_s - start_s) * fs_hint)) + 2)
+            times = np.empty(n_rows, dtype=float)
+            vals = np.empty(n_rows, dtype=float)
+            count = 0
+            with open(file_path, "rb") as f:
+                f.seek(int(layout["data_offset"]) + start_row * int(layout["line_len"]))
+                for _ in range(n_rows):
+                    line = f.read(int(layout["line_len"]))
+                    if not line:
+                        break
+                    parts = line.split(b"\t" if sep == "\t" else b",")
+                    if len(parts) <= 4:
+                        continue
+                    try:
+                        ti = float(parts[3])
+                        yi = float(parts[4])
+                    except Exception:
+                        continue
+                    if start_s <= ti <= end_s:
+                        times[count] = ti
+                        vals[count] = yi
+                        count += 1
+                    elif ti > end_s:
+                        break
+            return times[:count], vals[:count]
+
+    # Portable fallback. Slow on huge files, but works for non-fixed-width text exports.
+    rows = []
+    for t_chunk, y_chunk in iter_waveform_tabular_chunks(file_path, chunk_rows=200000):
+        if len(t_chunk) == 0:
+            continue
+        if t_chunk[-1] < start_s:
+            continue
+        if t_chunk[0] > end_s:
+            break
+        keep = (t_chunk >= start_s) & (t_chunk <= end_s)
+        if np.any(keep):
+            rows.append((t_chunk[keep], y_chunk[keep]))
+    if not rows:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    return np.concatenate([r[0] for r in rows]), np.concatenate([r[1] for r in rows])
+
+
+def _robust_z(x):
+    x = np.asarray(x, dtype=float)
+    med = np.nanmedian(x)
+    dev = mad(x, scale="normal", nan_policy="omit") + 1e-9
+    return (x - med) / dev
+
+
+def score_eeg_candidate_windows(source_file, bin_start_s, bin_end_s, fs_hint,
+                                window_s=20.0, step_s=60.0, top_n=2):
+    candidates = []
+    starts = np.arange(float(bin_start_s), max(float(bin_start_s), float(bin_end_s) - window_s), float(step_s))
+    for a in starts:
+        b = min(float(bin_end_s), float(a + window_s))
+        t, y = read_waveform_window(source_file, a, b, fs_hint=fs_hint)
+        if len(y) < max(10, int((fs_hint or 1000) * min(1.0, window_s * 0.2))):
+            continue
+        x = y - np.nanmedian(y)
+        rms = float(np.sqrt(np.nanmean(x * x)))
+        ptp = float(np.nanpercentile(x, 99) - np.nanpercentile(x, 1))
+        line_len = float(np.nansum(np.abs(np.diff(x))) / max(1e-9, (t[-1] - t[0])))
+        candidates.append({
+            "start_s": float(a),
+            "end_s": float(b),
+            "rms": rms,
+            "ptp": ptp,
+            "line_len": line_len,
+        })
+    if not candidates:
+        return []
+    df = pd.DataFrame(candidates)
+    df["score"] = _robust_z(df["rms"].values) + _robust_z(df["ptp"].values) + _robust_z(df["line_len"].values)
+    df.sort_values("score", ascending=False, inplace=True)
+
+    kept = []
+    for _, row in df.iterrows():
+        a, b = float(row["start_s"]), float(row["end_s"])
+        if any(not (b <= k["start_s"] or a >= k["end_s"]) for k in kept):
+            continue
+        kept.append(row.to_dict())
+        if len(kept) >= int(top_n):
+            break
+    return kept
+
+
+def save_eeg_debug_plot(source_file, events_df, out_png, start_s, end_s,
+                        fs_hint=None, title="", manual_note=""):
+    t, y = read_waveform_window(source_file, start_s, end_s, fs_hint=fs_hint)
+    if len(t) < 5:
+        raise ValueError(f"No waveform samples found for {start_s:.3f}-{end_s:.3f} s")
+    if fs_hint is not None and np.isfinite(float(fs_hint)):
+        fs = float(fs_hint)
+    else:
+        _, _, fs = ensure_uniform_sampling(t, y)
+
+    try:
+        t_u, y_u, fs = ensure_uniform_sampling(t, y, fs_target=fs)
+    except Exception:
+        t_u, y_u = t, y
+    try:
+        sig = eeg_preprocess(y_u, fs)
+    except Exception:
+        sig = y_u - np.nanmedian(y_u)
+
+    swd_trace = np.full_like(sig, np.nan, dtype=float)
+    hf_trace = np.full_like(sig, np.nan, dtype=float)
+    try:
+        swd_trace = _robust_z(bandpass_zero_phase(sig, fs, 5.0, min(12.0, 0.45 * fs), order=3))
+    except Exception:
+        pass
+    try:
+        hf_trace = _robust_z(np.abs(bandpass_zero_phase(sig, fs, 14.0, min(70.0, 0.45 * fs), order=3)))
+    except Exception:
+        pass
+
+    ev = pd.DataFrame(events_df).copy()
+    if len(ev):
+        ev["Start_s"] = pd.to_numeric(ev["Start_s"], errors="coerce")
+        ev["End_s"] = pd.to_numeric(ev["End_s"], errors="coerce")
+        ev = ev[(ev["End_s"] >= start_s) & (ev["Start_s"] <= end_s)].copy()
+
+    colours = {"Spike": "#F9A825", "SWD": "#0288D1", "Seizure": "#D32F2F"}
+    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
+    axes[0].plot(t_u, y_u, color="#333333", lw=0.6)
+    axes[0].set_ylabel("Raw")
+    axes[1].plot(t_u, sig, color="#111111", lw=0.7)
+    axes[1].set_ylabel("Filtered")
+    axes[2].plot(t_u, swd_trace, color="#0288D1", lw=0.8, label="5-12 Hz z")
+    axes[2].plot(t_u, hf_trace, color="#F9A825", lw=0.8, alpha=0.8, label="14-70 Hz abs z")
+    axes[2].set_ylabel("Detector traces")
+    axes[2].legend(loc="upper right", fontsize=8)
+
+    for ax in axes:
+        ax.grid(alpha=0.18)
+        for _, row in ev.iterrows():
+            typ = str(row.get("Type", ""))
+            colour = colours.get(typ, "#777777")
+            a = float(row["Start_s"])
+            b = float(row["End_s"])
+            if typ == "Spike" or abs(b - a) < 1e-9:
+                ax.axvline(a, color=colour, lw=1.2, alpha=0.85)
+            else:
+                ax.axvspan(a, b, color=colour, alpha=0.20)
+    axes[-1].set_xlabel("Time from start (s)")
+    fig.suptitle(title)
+    if manual_note:
+        axes[0].text(0.01, 0.98, manual_note, transform=axes[0].transAxes,
+                     va="top", ha="left", fontsize=9,
+                     bbox=dict(facecolor="white", edgecolor="#BBBBBB", alpha=0.85))
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
+def save_eeg_benchmark_plot(benchmark_df, out_png):
+    if benchmark_df is None or len(benchmark_df) == 0:
+        return
+    df = pd.DataFrame(benchmark_df).copy()
+    x = np.arange(len(df))
+    fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
+    specs = [
+        ("Spike", "Spikes"),
+        ("SWD", "SWDs"),
+        ("Seizure", "Seizures"),
+    ]
+    for ax, (key, label) in zip(axes, specs):
+        p = pd.to_numeric(df.get(f"Program_{key}", 0), errors="coerce").fillna(0)
+        m = pd.to_numeric(df.get(f"Manual_{key}", 0), errors="coerce").fillna(0)
+        ax.bar(x - 0.18, m, width=0.36, label="Manual", color="#455A64")
+        ax.bar(x + 0.18, p, width=0.36, label="Program", color="#EF6C00")
+        ax.set_ylabel(label)
+        ax.grid(axis="y", alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels([str(int(v)) for v in df["Bin_Index"]])
+    axes[-1].set_xlabel("Hour/bin")
+    fig.suptitle("EEG benchmark: manual vs program counts")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
+def build_eeg_debug_windows(summary_df, events_df, benchmark_df, source_file, fs_hint,
+                            event_pad_s=5.0, max_plots=40,
+                            candidate_window_s=20.0, candidate_step_s=60.0,
+                            candidate_count=2):
+    events = pd.DataFrame(events_df).copy()
+    if len(events):
+        events["Start_s"] = pd.to_numeric(events["Start_s"], errors="coerce")
+        events["End_s"] = pd.to_numeric(events["End_s"], errors="coerce")
+        events["Duration_s"] = pd.to_numeric(events["Duration_s"], errors="coerce").fillna(0.0)
+    bench = pd.DataFrame(benchmark_df).copy() if benchmark_df is not None else pd.DataFrame()
+    windows = []
+
+    def add_window(reason, start_s, end_s, priority, event_type="", bin_index=np.nan, note=""):
+        if len(windows) >= int(max_plots):
+            return
+        start_s = max(0.0, float(start_s))
+        end_s = max(start_s + 0.5, float(end_s))
+        windows.append({
+            "Reason": reason,
+            "Priority": int(priority),
+            "Type": event_type,
+            "Bin_Index": int(bin_index) if pd.notna(bin_index) else "",
+            "Start_s": start_s,
+            "End_s": end_s,
+            "Manual_Note": note,
+        })
+
+    if len(bench):
+        for _, b in bench.sort_values("Bin_Index").iterrows():
+            bin_idx = int(b["Bin_Index"])
+            bin_start = float(b["Bin_Start_s"])
+            bin_end = float(b["Bin_End_s"])
+            note = (
+                f"Bin {bin_idx}: manual spike/SWD/seizure="
+                f"{int(b.get('Manual_Spike', 0))}/{int(b.get('Manual_SWD', 0))}/{int(b.get('Manual_Seizure', 0))}; "
+                f"program={int(b.get('Program_Spike', 0))}/{int(b.get('Program_SWD', 0))}/{int(b.get('Program_Seizure', 0))}"
+            )
+
+            for typ in ["SWD", "Seizure"]:
+                over = int(b.get(f"Program_{typ}", 0)) - int(b.get(f"Manual_{typ}", 0))
+                if over > 0 and len(events):
+                    ev = events[(events["Type"].astype(str) == typ)
+                                & (events["Start_s"] >= bin_start)
+                                & (events["Start_s"] < bin_end)]
+                    for _, row in ev.iterrows():
+                        add_window(f"program_{typ}_over_manual", row["Start_s"] - event_pad_s,
+                                   row["End_s"] + event_pad_s, 1, typ, bin_idx, note)
+
+            missed_seizures = int(b.get("Manual_Seizure", 0)) - int(b.get("Program_Seizure", 0))
+            if missed_seizures > 0:
+                candidates = score_eeg_candidate_windows(
+                    source_file, bin_start, bin_end, fs_hint,
+                    window_s=candidate_window_s,
+                    step_s=candidate_step_s,
+                    top_n=max(1, int(candidate_count)),
+                )
+                for j, cand in enumerate(candidates, start=1):
+                    add_window(f"manual_seizure_missed_candidate_{j}", cand["start_s"], cand["end_s"],
+                               2, "Candidate", bin_idx,
+                               note + f"; candidate score={cand.get('score', np.nan):.2f}")
+
+        spike_errors = bench.copy()
+        if "Abs_Error_Spike" in spike_errors.columns and len(events):
+            spike_errors = spike_errors[pd.to_numeric(spike_errors["Abs_Error_Spike"], errors="coerce").fillna(0) > 0]
+            spike_errors = spike_errors.sort_values("Abs_Error_Spike", ascending=False).head(6)
+            for _, b in spike_errors.iterrows():
+                bin_idx = int(b["Bin_Index"])
+                bin_start = float(b["Bin_Start_s"])
+                bin_end = float(b["Bin_End_s"])
+                ev = events[(events["Type"].astype(str) == "Spike")
+                            & (events["Start_s"] >= bin_start)
+                            & (events["Start_s"] < bin_end)].head(2)
+                note = (
+                    f"Bin {bin_idx}: manual spikes={int(b.get('Manual_Spike', 0))}; "
+                    f"program spikes={int(b.get('Program_Spike', 0))}"
+                )
+                for _, row in ev.iterrows():
+                    add_window("spike_count_mismatch", row["Start_s"] - event_pad_s,
+                               row["Start_s"] + event_pad_s, 3, "Spike", bin_idx, note)
+
+    else:
+        for _, row in events.head(int(max_plots)).iterrows():
+            add_window("program_event", row["Start_s"] - event_pad_s, row["End_s"] + event_pad_s,
+                       9, str(row.get("Type", "")), "", "")
+
+    df = pd.DataFrame(windows)
+    if len(df):
+        df.sort_values(["Priority", "Start_s"], inplace=True)
+        df = df.head(int(max_plots)).reset_index(drop=True)
+    return df
 
 
 # ============================================================
@@ -1789,6 +3096,17 @@ class ECGReviewWindow(tk.Toplevel):
 
         self._build_ui()
         self._load_current_beat()
+
+    def destroy(self):
+        if hasattr(self, "fig"):
+            try:
+                plt.close(self.fig)
+            except Exception:
+                pass
+        for attr in ("selected_landmark", "notes_var", "info_var", "status_var"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        super().destroy()
 
     def _resolve_source_file(self, source_file):
         if source_file and os.path.exists(source_file):
@@ -2004,18 +3322,556 @@ class ECGReviewWindow(tk.Toplevel):
         messagebox.showinfo("Saved", f"Workbook overwritten with corrected ECG data:\n{self.workbook_path}", parent=self)
 
 
+class EEGReviewWindow(tk.Toplevel):
+    EVENT_COLOURS = {
+        "Spike": "#F9A825",
+        "SWD": "#0288D1",
+        "Seizure": "#D32F2F",
+    }
+
+    def __init__(self, parent, workbook_path):
+        super().__init__(parent)
+        self.workbook_path = os.path.abspath(workbook_path)
+        self.title(f"EEG Review - {os.path.basename(self.workbook_path)}")
+        self.geometry("1220x820")
+        self.minsize(1040, 720)
+
+        self.summary_df, self.events_df, self.meta = load_eeg_workbook(self.workbook_path)
+        self.meta = dict(self.meta or {})
+        self.source_file = self._resolve_source_file(str(self.meta.get("source_file", "")))
+        self.meta["source_file"] = self.source_file
+
+        fs_meta = pd.to_numeric(pd.Series([self.meta.get("fs_Hz", np.nan)]), errors="coerce").iloc[0]
+        self.fs = float(fs_meta) if np.isfinite(fs_meta) and fs_meta > 0 else 2000.0
+        self.current_order_pos = 0
+        self.review_order = self._build_review_order()
+
+        self.event_type_var = tk.StringVar(value="Spike")
+        self.marker_var = tk.StringVar(value="Start_s")
+        self.start_var = tk.StringVar(value="0.000")
+        self.end_var = tk.StringVar(value="0.000")
+        self.window_var = tk.StringVar(value="20")
+        self.notes_var = tk.StringVar(value="")
+        self.info_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="Loaded EEG review session. Shortcuts: Ctrl+1=start, Ctrl+2=end, Ctrl+Delete=delete, Ctrl+S=save.")
+
+        self.t_view = np.array([], dtype=float)
+        self.raw_view = np.array([], dtype=float)
+        self.filtered_view = np.array([], dtype=float)
+        self.swd_trace = np.array([], dtype=float)
+        self.hf_trace = np.array([], dtype=float)
+
+        self._build_ui()
+        self._bind_shortcuts()
+        if self.review_order:
+            self._load_current_event()
+        else:
+            self._refresh_info()
+            self._draw_current_event()
+
+    def destroy(self):
+        if hasattr(self, "fig"):
+            try:
+                plt.close(self.fig)
+            except Exception:
+                pass
+        for attr in ("event_type_var", "marker_var", "start_var", "end_var",
+                     "window_var", "notes_var", "info_var", "status_var"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        super().destroy()
+
+    def _resolve_source_file(self, source_file):
+        if source_file and os.path.exists(source_file):
+            return os.path.abspath(source_file)
+        messagebox.showwarning(
+            "Source file not found",
+            "Source TSV path in workbook metadata is missing or unavailable.\nPlease select the original EEG TSV file.",
+            parent=self,
+        )
+        selected = filedialog.askopenfilename(
+            parent=self,
+            title="Select source TSV/TXT/CSV/Excel file for EEG review",
+            filetypes=[
+                ("Tab/CSV/Excel", "*.tsv *.txt *.csv *.xlsx *.xls"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not selected:
+            raise ValueError("Review canceled: source waveform file is required.")
+        return os.path.abspath(selected)
+
+    def _build_review_order(self):
+        view = ensure_eeg_events_schema(self.events_df)
+        if not len(view):
+            return []
+        view = view.assign(_deleted=view["Is_Deleted"].apply(_to_bool).astype(int))
+        view.sort_values(["_deleted", "Start_s", "Event_Index"], inplace=True)
+        return view["Event_Index"].astype(int).tolist()
+
+    def _build_ui(self):
+        top = tk.Frame(self, padx=10, pady=8)
+        top.pack(fill="x")
+
+        tk.Label(top, text="Type:", font=("Arial", 10, "bold")).pack(side="left")
+        ttk.Combobox(top, values=EEG_EVENT_TYPES, textvariable=self.event_type_var,
+                     state="readonly", width=10).pack(side="left", padx=5)
+
+        tk.Label(top, text="Click edits:", font=("Arial", 10, "bold")).pack(side="left", padx=(12, 0))
+        ttk.Combobox(top, values=["Start_s", "End_s"], textvariable=self.marker_var,
+                     state="readonly", width=9).pack(side="left", padx=5)
+        tk.Button(top, text="Click=Start", command=lambda: self._set_marker("Start_s")).pack(side="left", padx=2)
+        tk.Button(top, text="Click=End", command=lambda: self._set_marker("End_s")).pack(side="left", padx=2)
+
+        tk.Label(top, text="Start s:").pack(side="left", padx=(12, 0))
+        tk.Entry(top, textvariable=self.start_var, width=11).pack(side="left", padx=4)
+        tk.Label(top, text="End s:").pack(side="left")
+        tk.Entry(top, textvariable=self.end_var, width=11).pack(side="left", padx=4)
+        tk.Label(top, text="Window s:").pack(side="left", padx=(12, 0))
+        tk.Entry(top, textvariable=self.window_var, width=6).pack(side="left", padx=4)
+
+        tk.Button(top, text="Prev", command=self._prev_event, bg="#455A64", fg="white").pack(side="left", padx=5)
+        tk.Button(top, text="Next", command=self._next_event, bg="#455A64", fg="white").pack(side="left", padx=5)
+        tk.Button(top, text="Apply", command=self._apply_fields, bg="#1E88E5", fg="white").pack(side="left", padx=5)
+        tk.Button(top, text="Add Event", command=self._add_event, bg="#2E7D32", fg="white").pack(side="left", padx=5)
+        tk.Button(top, text="Delete Event", command=lambda: self._set_deleted(True), bg="#C62828", fg="white").pack(side="left", padx=5)
+        tk.Button(top, text="Restore Event", command=lambda: self._set_deleted(False), bg="#EF6C00", fg="white").pack(side="left", padx=5)
+        tk.Button(top, text="Save Review + Notes", command=self._save_workbook, bg="#2E7D32", fg="white").pack(side="left", padx=10)
+        tk.Button(top, text="Close", command=self.destroy, bg="#757575", fg="white").pack(side="right")
+
+        note_row = tk.Frame(self, padx=10, pady=4)
+        note_row.pack(fill="x")
+        tk.Label(note_row, text="Correction notes:", font=("Arial", 10, "bold")).pack(side="left")
+        tk.Entry(note_row, textvariable=self.notes_var).pack(side="left", fill="x", expand=True, padx=6)
+        tk.Button(note_row, text="Apply Note", command=self._apply_note).pack(side="left", padx=4)
+        tk.Button(note_row, text="Save Current Plot", command=self._save_current_plot).pack(side="left", padx=4)
+
+        info = tk.Label(self, textvariable=self.info_var, anchor="w", justify="left",
+                        font=("Consolas", 9), padx=10, pady=4)
+        info.pack(fill="x")
+
+        status = tk.Label(self, textvariable=self.status_var, anchor="w", fg="#1E88E5", padx=10, pady=4)
+        status.pack(fill="x")
+
+        fig_frame = tk.Frame(self, padx=8, pady=6)
+        fig_frame.pack(fill="both", expand=True)
+        self.fig, self.axes = plt.subplots(3, 1, figsize=(12, 6.8), sharex=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=fig_frame)
+        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_click)
+
+    def _bind_shortcuts(self):
+        self.bind("<Left>", lambda event: self._prev_event())
+        self.bind("<Right>", lambda event: self._next_event())
+        self.bind("<Control-s>", lambda event: self._save_workbook())
+        self.bind("<Control-S>", lambda event: self._save_workbook())
+        self.bind("<Control-Key-1>", lambda event: self._set_marker("Start_s"))
+        self.bind("<Control-Key-2>", lambda event: self._set_marker("End_s"))
+        self.bind("<Control-Delete>", lambda event: self._set_deleted(True))
+        self.bind("<Control-BackSpace>", lambda event: self._set_deleted(True))
+
+    def _set_marker(self, marker):
+        if marker not in ("Start_s", "End_s"):
+            return
+        self.marker_var.set(marker)
+        label = "start" if marker == "Start_s" else "end"
+        self.status_var.set(f"Plot clicks now set event {label}.")
+        self._draw_current_event()
+
+    def _current_event_index(self):
+        if not self.review_order:
+            return None
+        return int(self.review_order[self.current_order_pos])
+
+    def _current_row_index(self):
+        event_index = self._current_event_index()
+        if event_index is None:
+            return None
+        idx = self.events_df.index[self.events_df["Event_Index"].astype(int) == event_index]
+        if len(idx) == 0:
+            raise ValueError(f"Event index {event_index} not found in dataframe.")
+        return int(idx[0])
+
+    def _load_current_event(self):
+        row_idx = self._current_row_index()
+        if row_idx is None:
+            self.start_var.set("0.000")
+            self.end_var.set("0.000")
+            self.notes_var.set("")
+            self.event_type_var.set("Spike")
+        else:
+            row = self.events_df.iloc[row_idx]
+            self.event_type_var.set(_normalize_eeg_event_type(row.get("Type", "Spike")))
+            self.start_var.set(f"{float(row.get('Start_s', 0.0)):.4f}")
+            self.end_var.set(f"{float(row.get('End_s', row.get('Start_s', 0.0))):.4f}")
+            self.notes_var.set(str(row.get("Correction_Notes", "")))
+        self._draw_current_event()
+        self._refresh_info()
+
+    def _parse_fields(self):
+        typ = _normalize_eeg_event_type(self.event_type_var.get())
+        start = float(self.start_var.get().strip())
+        end = float(self.end_var.get().strip()) if self.end_var.get().strip() else start
+        if typ == "Spike":
+            end = start
+        if end < start:
+            start, end = end, start
+        return typ, start, end
+
+    def _visible_range(self):
+        try:
+            _, start, end = self._parse_fields()
+        except Exception:
+            start, end = 0.0, 0.0
+        win_s = max(1.0, float(self.window_var.get().strip() or 20.0))
+        if end > start:
+            center = 0.5 * (start + end)
+            width = max(win_s, (end - start) + 10.0)
+        else:
+            center = start
+            width = win_s
+        return max(0.0, center - 0.5 * width), center + 0.5 * width
+
+    def _load_view_data(self, start_s, end_s):
+        t, y = read_waveform_window(self.source_file, start_s, end_s, fs_hint=self.fs)
+        if len(t) < 5:
+            self.t_view = np.array([], dtype=float)
+            self.raw_view = np.array([], dtype=float)
+            self.filtered_view = np.array([], dtype=float)
+            self.swd_trace = np.array([], dtype=float)
+            self.hf_trace = np.array([], dtype=float)
+            return
+        try:
+            t_u, y_u, fs = ensure_uniform_sampling(t, y, fs_target=self.fs)
+            self.fs = float(fs)
+        except Exception:
+            t_u, y_u = t, y
+        self.t_view = np.asarray(t_u, dtype=float)
+        self.raw_view = np.asarray(y_u, dtype=float)
+        try:
+            self.filtered_view = eeg_preprocess(self.raw_view, self.fs)
+        except Exception:
+            self.filtered_view = self.raw_view - np.nanmedian(self.raw_view)
+        try:
+            self.swd_trace = _robust_z(bandpass_zero_phase(
+                self.filtered_view, self.fs, 5.0, min(12.0, 0.45 * self.fs), order=3
+            ))
+        except Exception:
+            self.swd_trace = np.zeros_like(self.filtered_view)
+        try:
+            self.hf_trace = _robust_z(np.abs(bandpass_zero_phase(
+                self.filtered_view, self.fs, 14.0, min(70.0, 0.45 * self.fs), order=3
+            )))
+        except Exception:
+            self.hf_trace = np.zeros_like(self.filtered_view)
+
+    def _draw_current_event(self):
+        start_s, end_s = self._visible_range()
+        self._load_view_data(start_s, end_s)
+        for ax in self.axes:
+            ax.clear()
+            ax.grid(alpha=0.18)
+        if len(self.t_view) == 0:
+            self.axes[0].text(0.5, 0.5, "No waveform samples in this window.",
+                              transform=self.axes[0].transAxes, ha="center", va="center")
+            self.canvas.draw_idle()
+            return
+
+        self.axes[0].plot(self.t_view, self.raw_view, color="#333333", lw=0.6)
+        self.axes[0].set_ylabel("Raw")
+        self.axes[1].plot(self.t_view, self.filtered_view, color="#111111", lw=0.7)
+        self.axes[1].set_ylabel("Filtered")
+        self.axes[2].plot(self.t_view, self.swd_trace, color="#0288D1", lw=0.8, label="5-12 Hz z")
+        self.axes[2].plot(self.t_view, self.hf_trace, color="#F9A825", lw=0.8, alpha=0.8, label="14-70 Hz abs z")
+        self.axes[2].set_ylabel("Detector")
+        self.axes[2].legend(loc="upper right", fontsize=8)
+
+        current_idx = self._current_event_index()
+        active = ensure_eeg_events_schema(self.events_df)
+        ev_win = active[(active["End_s"] >= start_s) & (active["Start_s"] <= end_s)]
+        for _, row in ev_win.iterrows():
+            typ = str(row["Type"])
+            colour = self.EVENT_COLOURS.get(typ, "#777777")
+            a = float(row["Start_s"])
+            b = float(row["End_s"])
+            is_current = current_idx is not None and int(row["Event_Index"]) == current_idx
+            deleted = _to_bool(row.get("Is_Deleted", False))
+            alpha = 0.10 if deleted else 0.25
+            lw = 2.2 if is_current else 1.0
+            for ax in self.axes:
+                if typ == "Spike" or abs(b - a) < 1e-9:
+                    ax.axvline(a, color=colour, lw=lw, alpha=0.90 if not deleted else 0.35,
+                               linestyle="--" if deleted else "-")
+                else:
+                    ax.axvspan(a, b, color=colour, alpha=alpha)
+                    if is_current:
+                        ax.axvline(a, color=colour, lw=lw)
+                        ax.axvline(b, color=colour, lw=lw)
+
+        try:
+            typ, a, b = self._parse_fields()
+            colour = self.EVENT_COLOURS.get(typ, "#000000")
+            for ax in self.axes:
+                ax.axvline(a, color=colour, lw=1.5, linestyle=":")
+                if typ != "Spike":
+                    ax.axvline(b, color=colour, lw=1.5, linestyle=":")
+        except Exception:
+            pass
+
+        title = "New event" if current_idx is None else f"Event {current_idx}"
+        self.axes[0].set_title(f"{title} | click sets {self.marker_var.get()} | source={os.path.basename(self.source_file)}")
+        self.axes[-1].set_xlabel("Time from start (s)")
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+
+    def _on_plot_click(self, event):
+        if event.xdata is None:
+            return
+        clicked = float(event.xdata)
+        marker = self.marker_var.get()
+        typ = _normalize_eeg_event_type(self.event_type_var.get())
+        if typ == "Spike":
+            self.start_var.set(f"{clicked:.4f}")
+            self.end_var.set(f"{clicked:.4f}")
+        elif marker == "Start_s":
+            self.start_var.set(f"{clicked:.4f}")
+        else:
+            self.end_var.set(f"{clicked:.4f}")
+        self._apply_fields()
+
+    def _apply_fields(self):
+        row_idx = self._current_row_index()
+        if row_idx is None:
+            self._add_event()
+            return
+        typ, start, end = self._parse_fields()
+        self.events_df.at[row_idx, "Type"] = typ
+        self.events_df.at[row_idx, "Start_s"] = start
+        self.events_df.at[row_idx, "End_s"] = end
+        self.events_df.at[row_idx, "Duration_s"] = max(0.0, end - start)
+        self.events_df.at[row_idx, "Is_Corrected"] = True
+        self.events_df.at[row_idx, "Corrected_At"] = now_iso()
+        self.events_df.at[row_idx, "Correction_Source"] = "manual_review"
+        self.events_df.at[row_idx, "Correction_Notes"] = self.notes_var.get().strip()
+        self.events_df = ensure_eeg_events_schema(self.events_df)
+        current = self._current_event_index()
+        self.review_order = self._build_review_order()
+        if current in self.review_order:
+            self.current_order_pos = self.review_order.index(current)
+        self.status_var.set(f"Updated event {current}: {typ} {start:.4f}-{end:.4f} s.")
+        self._load_current_event()
+
+    def _sync_current_review_fields(self, correction_source="manual_review_save"):
+        row_idx = self._current_row_index()
+        if row_idx is None:
+            return False
+        typ, start, end = self._parse_fields()
+        note = self.notes_var.get().strip()
+        old = self.events_df.iloc[row_idx]
+        old_start = pd.to_numeric(pd.Series([old.get("Start_s", np.nan)]), errors="coerce").iloc[0]
+        old_end = pd.to_numeric(pd.Series([old.get("End_s", np.nan)]), errors="coerce").iloc[0]
+        changed = (
+            _normalize_eeg_event_type(old.get("Type", "Spike")) != typ
+            or not np.isclose(float(old_start), start, atol=1e-9, equal_nan=False)
+            or not np.isclose(float(old_end), end, atol=1e-9, equal_nan=False)
+            or str(old.get("Correction_Notes", "") or "").strip() != note
+        )
+        if not changed:
+            return False
+        self.events_df.at[row_idx, "Type"] = typ
+        self.events_df.at[row_idx, "Start_s"] = start
+        self.events_df.at[row_idx, "End_s"] = end
+        self.events_df.at[row_idx, "Duration_s"] = max(0.0, end - start)
+        self.events_df.at[row_idx, "Correction_Notes"] = note
+        self.events_df.at[row_idx, "Is_Corrected"] = True
+        self.events_df.at[row_idx, "Corrected_At"] = now_iso()
+        self.events_df.at[row_idx, "Correction_Source"] = correction_source
+        self.events_df = ensure_eeg_events_schema(self.events_df)
+        current = self._current_event_index()
+        self.review_order = self._build_review_order()
+        if current in self.review_order:
+            self.current_order_pos = self.review_order.index(current)
+        return True
+
+    def _apply_note(self):
+        row_idx = self._current_row_index()
+        if row_idx is None:
+            return
+        self.events_df.at[row_idx, "Correction_Notes"] = self.notes_var.get().strip()
+        self.events_df.at[row_idx, "Is_Corrected"] = True
+        self.events_df.at[row_idx, "Corrected_At"] = now_iso()
+        self.events_df.at[row_idx, "Correction_Source"] = "manual_review"
+        self.status_var.set(f"Updated note for event {self._current_event_index()}.")
+        self._refresh_info()
+
+    def _add_event(self):
+        typ, start, end = self._parse_fields()
+        next_idx = int(self.events_df["Event_Index"].max() + 1) if len(self.events_df) else 0
+        new_row = {
+            "Event_Index": next_idx,
+            "Type": typ,
+            "Start_s": start,
+            "End_s": end,
+            "Duration_s": max(0.0, end - start),
+            "Confidence": np.nan,
+            "Is_Corrected": True,
+            "Is_Deleted": False,
+            "Corrected_At": now_iso(),
+            "Correction_Source": "manual_review_add",
+            "Correction_Notes": self.notes_var.get().strip(),
+        }
+        self.events_df = ensure_eeg_events_schema(pd.concat([self.events_df, pd.DataFrame([new_row])], ignore_index=True))
+        self.review_order = self._build_review_order()
+        self.current_order_pos = self.review_order.index(next_idx)
+        self.status_var.set(f"Added event {next_idx}: {typ} {start:.4f}-{end:.4f} s.")
+        self._load_current_event()
+
+    def _toggle_deleted(self):
+        row_idx = self._current_row_index()
+        if row_idx is None:
+            return
+        self._set_deleted(not _to_bool(self.events_df.at[row_idx, "Is_Deleted"]))
+
+    def _set_deleted(self, deleted):
+        row_idx = self._current_row_index()
+        if row_idx is None:
+            return
+        deleted = bool(deleted)
+        if _to_bool(self.events_df.at[row_idx, "Is_Deleted"]) == deleted:
+            self.status_var.set(("Already deleted" if deleted else "Already active") + f": event {self._current_event_index()}.")
+            self._refresh_info()
+            return
+        self.events_df.at[row_idx, "Is_Deleted"] = deleted
+        self.events_df.at[row_idx, "Is_Corrected"] = True
+        self.events_df.at[row_idx, "Corrected_At"] = now_iso()
+        self.events_df.at[row_idx, "Correction_Source"] = "manual_review_delete" if deleted else "manual_review_restore"
+        note = self.notes_var.get().strip()
+        if note:
+            self.events_df.at[row_idx, "Correction_Notes"] = note
+        elif deleted:
+            self.events_df.at[row_idx, "Correction_Notes"] = "Deleted during EEG review"
+        self.status_var.set(("Deleted" if deleted else "Restored") + f" event {self._current_event_index()}.")
+        self.events_df = ensure_eeg_events_schema(self.events_df)
+        current = self._current_event_index()
+        self.review_order = self._build_review_order()
+        if current in self.review_order:
+            self.current_order_pos = self.review_order.index(current)
+        self._load_current_event()
+
+    def _prev_event(self):
+        if self.current_order_pos > 0:
+            self.current_order_pos -= 1
+            self._load_current_event()
+
+    def _next_event(self):
+        if self.current_order_pos < len(self.review_order) - 1:
+            self.current_order_pos += 1
+            self._load_current_event()
+
+    def _recompute_summary(self):
+        bin_s = pd.to_numeric(pd.Series([self.meta.get("bin_size_s", np.nan)]), errors="coerce").iloc[0]
+        if not (np.isfinite(bin_s) and bin_s > 0):
+            if len(self.summary_df) and {"Bin_Start_s", "Bin_End_s"}.issubset(self.summary_df.columns):
+                bin_s = float(pd.to_numeric(self.summary_df["Bin_End_s"] - self.summary_df["Bin_Start_s"],
+                                            errors="coerce").dropna().median())
+            else:
+                bin_s = 3600.0
+        if len(self.summary_df) and {"Bin_Start_s", "Bin_End_s"}.issubset(self.summary_df.columns):
+            t0 = float(pd.to_numeric(self.summary_df["Bin_Start_s"], errors="coerce").min())
+            t1 = float(pd.to_numeric(self.summary_df["Bin_End_s"], errors="coerce").max())
+        else:
+            t0 = 0.0
+            rec_dur = pd.to_numeric(pd.Series([self.meta.get("recording_duration_s", np.nan)]), errors="coerce").iloc[0]
+            t1 = float(rec_dur) if np.isfinite(rec_dur) and rec_dur > 0 else float(bin_s)
+        self.summary_df = recompute_eeg_bins_from_events(self.events_df, float(bin_s), t0=t0, t1=t1)
+
+    def _save_workbook(self):
+        try:
+            synced = self._sync_current_review_fields(correction_source="manual_review_save")
+        except Exception as exc:
+            messagebox.showerror("Save failed", f"Could not apply current event fields before saving:\n{exc}", parent=self)
+            return
+        before_dedupe = len(self.events_df)
+        self.events_df = dedupe_eeg_events(self.events_df)
+        deduped_count = max(0, before_dedupe - len(self.events_df))
+        self._recompute_summary()
+        self.meta["review_last_saved_at"] = now_iso()
+        self.meta["review_source"] = "manual_eeg_ui"
+        self.meta["source_file"] = self.source_file
+        self.meta["fs_Hz"] = float(self.fs)
+        self.meta["review_notes_count"] = int((self.events_df["Correction_Notes"].fillna("").astype(str).str.strip() != "").sum()) if len(self.events_df) else 0
+        self.meta["review_deduped_events"] = int(deduped_count)
+        self.meta = update_eeg_meta_from_events(self.meta, self.events_df, self.summary_df)
+        export_eeg_excel(self.workbook_path, self.summary_df, self.events_df, self.meta)
+        self.status_var.set(f"Saved EEG workbook with review edits and notes: {self.workbook_path}")
+        self._refresh_info()
+        extra = "\nCurrent event fields/notes were applied before saving." if synced else ""
+        messagebox.showinfo("Saved", f"Workbook overwritten with corrected EEG data and notes:\n{self.workbook_path}{extra}", parent=self)
+
+    def _save_current_plot(self):
+        start_s, end_s = self._visible_range()
+        default = f"eeg_event_{self._current_event_index() if self._current_event_index() is not None else 'new'}.png"
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save current EEG debug plot",
+            defaultextension=".png",
+            initialfile=default,
+            filetypes=[("PNG", "*.png"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        save_eeg_debug_plot(
+            self.source_file,
+            self.events_df,
+            path,
+            start_s,
+            end_s,
+            fs_hint=self.fs,
+            title=f"EEG review window {start_s:.2f}-{end_s:.2f} s",
+            manual_note=self.notes_var.get().strip(),
+        )
+        self.status_var.set(f"Saved plot: {path}")
+
+    def _refresh_info(self):
+        active = active_eeg_events(self.events_df)
+        counts = active["Type"].value_counts().to_dict() if len(active) else {}
+        deleted = int(self.events_df["Is_Deleted"].apply(_to_bool).sum()) if len(self.events_df) else 0
+        corrected = int(self.events_df["Is_Corrected"].apply(_to_bool).sum()) if len(self.events_df) else 0
+        row_idx = self._current_row_index()
+        if row_idx is None:
+            current = "No events yet. Type start/end times, choose type, then Add Event."
+        else:
+            row = self.events_df.iloc[row_idx]
+            current = (
+                f"Event {int(row['Event_Index'])} ({self.current_order_pos + 1}/{len(self.review_order)}) | "
+                f"{row['Type']} {float(row['Start_s']):.4f}-{float(row['End_s']):.4f} s | "
+                f"deleted={bool(_to_bool(row['Is_Deleted']))}"
+            )
+        self.info_var.set(
+            f"{current} | Active counts: spikes={int(counts.get('Spike', 0))}, "
+            f"SWDs={int(counts.get('SWD', 0))}, seizures={int(counts.get('Seizure', 0))} | "
+            f"corrected={corrected}, deleted={deleted}"
+        )
+
+
 # ============================================================
 # 8) UNIFIED GUI
 # ============================================================
 class UnifiedAnalyzerApp:
     def __init__(self, root):
         self.root         = root
+        self._main_thread_id = threading.get_ident()
         self.root.title("SUDEP Waveform Analyzer — EEG / ECG")
         self.root.geometry("920x700")
         self.root.resizable(True, True)
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.input_file   = None
         self.results      = None
         self.is_analyzing = False
+        self._batch_proc = None
+        self._batch_log_handle = None
+        self._batch_log_path = None
+        self._batch_output_path = None
         self._build_ui()
 
     def _build_ui(self):
@@ -2106,14 +3962,35 @@ class UnifiedAnalyzerApp:
                                     bg="#6A1B9A", fg="white",
                                     font=("Arial", 11, "bold"), padx=16, pady=10)
         self.review_btn.pack(side="left", padx=8)
+        self.review_eeg_btn = tk.Button(btn_f, text="Review EEG Workbook",
+                                        command=self._open_eeg_review_workbook,
+                                        bg="#00695C", fg="white",
+                                        font=("Arial", 11, "bold"), padx=16, pady=10)
+        self.review_eeg_btn.pack(side="left", padx=8)
         tk.Button(btn_f, text="Reset", command=self._reset,
                   bg="#E53935", fg="white",
                   font=("Arial", 11, "bold"), padx=16, pady=10).pack(side="left", padx=8)
-        tk.Button(btn_f, text="Exit",  command=self.root.quit,
+        tk.Button(btn_f, text="Exit",  command=self._close,
                   bg="#757575", fg="white",
                   font=("Arial", 11, "bold"), padx=16, pady=10).pack(side="right", padx=8)
 
         self._on_mode_change()
+
+    def _ui_call(self, func, *args, **kwargs):
+        if threading.get_ident() == self._main_thread_id:
+            return func(*args, **kwargs)
+
+        def _run():
+            try:
+                func(*args, **kwargs)
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after(0, _run)
+        except (RuntimeError, tk.TclError):
+            pass
+        return None
 
     def _on_mode_change(self):
         if self.mode_var.get() == "ECG":
@@ -2124,15 +4001,108 @@ class UnifiedAnalyzerApp:
             self.ecg_f.pack_forget()
 
     def _set_progress(self, pct, msg):
+        if threading.get_ident() != self._main_thread_id:
+            self._ui_call(self._set_progress, pct, msg)
+            return
         self.progress["value"] = float(pct)
         self.status.config(text=msg, fg="#1E88E5")
         self.root.update_idletasks()
 
     def _log(self, text):
+        if threading.get_ident() != self._main_thread_id:
+            self._ui_call(self._log, text)
+            return
         self.result_text.config(state="normal")
         self.result_text.delete("1.0", "end")
         self.result_text.insert("end", text)
         self.result_text.config(state="disabled")
+
+    def _finish_analysis_ui(self):
+        self.is_analyzing = False
+        self.analyze_btn.config(state="normal" if self.input_file else "disabled")
+
+    def _show_ecg_debug_plots(self, y, fs, beat_rows):
+        try:
+            sig_filt, _ = auto_bandpass_notch_ecg(y, fs)
+            df = ensure_ecg_beats_schema(pd.DataFrame(beat_rows))
+            for _, row in df.head(5).iterrows():
+                r_idx = _to_optional_int(row.get("R_idx"))
+                if np.isnan(r_idx):
+                    continue
+                r_idx = int(r_idx)
+                sl = max(0, r_idx - int(0.110 * fs))
+                el = min(len(sig_filt), r_idx + int(0.250 * fs))
+                xv = np.arange(sl, el) / fs
+
+                plt.figure(figsize=(13, 4))
+                plt.plot(xv, sig_filt[sl:el], color="darkred", lw=1, label="ECG")
+                for col in LANDMARK_COLUMNS:
+                    idx = _to_optional_int(row.get(col))
+                    if np.isnan(idx):
+                        continue
+                    idx = int(idx)
+                    if 0 <= idx < len(sig_filt):
+                        color, marker, label = ECGReviewWindow.MARKER_STYLE[col]
+                        plt.scatter(idx / fs, sig_filt[idx], color=color, s=80,
+                                    marker=marker, zorder=5, label=label)
+                plt.title(f"Beat {int(row['Beat_Index'])} | conf={row.get('Confidence', np.nan):.2f}")
+                plt.xlabel("Time (s)")
+                plt.ylabel("Amplitude")
+                plt.grid(alpha=0.2)
+                plt.legend(fontsize=8)
+                plt.tight_layout()
+                plt.show(block=False)
+        except Exception as exc:
+            self.status.config(text=f"Debug plot skipped: {exc}", fg="#FB8C00")
+
+    def _show_eeg_debug_plots(self, t, y, fs, events_df):
+        try:
+            if events_df is None or len(events_df) == 0:
+                return
+            sig = eeg_preprocess(y, fs)
+            t0 = float(t[0])
+            t1 = float(t[-1])
+            for _, row in events_df.head(3).iterrows():
+                a = max(t0, float(row["Start_s"]) - 2.0)
+                b = min(t1, float(row["End_s"]) + 2.0)
+                i0 = np.searchsorted(t, a)
+                i1 = np.searchsorted(t, b)
+                plt.figure(figsize=(12, 4))
+                plt.plot(t[i0:i1], sig[i0:i1], "k", lw=0.9)
+                colour = {"Spike": "gold", "SWD": "lightskyblue", "Seizure": "tomato"}.get(row["Type"], "grey")
+                plt.axvspan(row["Start_s"], row["End_s"], alpha=0.25, color=colour)
+                plt.title(f'{row["Type"]}  {row["Start_s"]:.2f}-{row["End_s"]:.2f} s  conf={row["Confidence"]:.2f}')
+                plt.xlabel("Time (s)")
+                plt.ylabel("EEG (a.u.)")
+                plt.grid(alpha=0.2)
+                plt.tight_layout()
+                plt.show(block=False)
+        except Exception as exc:
+            self.status.config(text=f"Debug plot skipped: {exc}", fg="#FB8C00")
+
+    def _close(self):
+        if self._batch_proc is not None and self._batch_proc.poll() is None:
+            try:
+                self._batch_proc.terminate()
+            except Exception:
+                pass
+        if self._batch_log_handle is not None:
+            try:
+                self._batch_log_handle.close()
+            except Exception:
+                pass
+            self._batch_log_handle = None
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        for attr in ("mode_var", "ecg_engine_var", "debug_var", "force_fs_var"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _browse(self):
         path = filedialog.askopenfilename(
@@ -2147,6 +4117,27 @@ class UnifiedAnalyzerApp:
                 text=f"{os.path.basename(path)}  ({size_mb:.2f} MB)", fg="black")
             self.analyze_btn.config(state="normal")
 
+    def _collect_analysis_settings(self):
+        mode = self.mode_var.get()
+        force_fs_enabled = bool(self.force_fs_var.get())
+        force_fs_value = None
+        if force_fs_enabled:
+            force_fs_value = float(self.force_fs_entry.get().strip())
+
+        eeg_bin_s = None
+        if mode == "EEG":
+            eeg_bin_s = float(self.eeg_bin_entry.get().strip())
+
+        return {
+            "input_file": self.input_file,
+            "mode": mode,
+            "debug_plots": bool(self.debug_var.get()),
+            "force_fs_enabled": force_fs_enabled,
+            "force_fs_value": force_fs_value,
+            "ecg_engine": self.ecg_engine_var.get(),
+            "eeg_bin_s": eeg_bin_s,
+        }
+
     def _start_analysis(self):
         if not self.input_file:
             messagebox.showerror("Error", "Please select a file first.")
@@ -2154,38 +4145,210 @@ class UnifiedAnalyzerApp:
         if self.is_analyzing:
             messagebox.showwarning("Busy", "Analysis already running.")
             return
+        try:
+            settings = self._collect_analysis_settings()
+        except Exception as exc:
+            messagebox.showerror("Invalid settings", str(exc))
+            return
+        if settings["mode"] == "EEG" and self._is_large_eeg_file(settings["input_file"]):
+            self._start_large_eeg_analysis(settings)
+            return
         self.is_analyzing = True
         self.analyze_btn.config(state="disabled")
         self.export_btn.config(state="disabled")
         self.progress["value"] = 0
-        threading.Thread(target=self._run_analysis, daemon=True).start()
+        self.root.after(10, lambda: self._run_analysis(settings))
 
-    def _run_analysis(self):
+    def _is_large_eeg_file(self, file_path):
+        try:
+            return os.path.getsize(file_path) / 1024 / 1024 >= 128.0
+        except Exception:
+            return False
+
+    def _start_large_eeg_analysis(self, settings):
+        input_file = settings["input_file"]
+        out_name = f"{os.path.splitext(os.path.basename(input_file))[0]}_EEG_results.xlsx"
+        output_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            initialfile=out_name,
+            initialdir=os.path.dirname(input_file),
+            filetypes=[("Excel", "*.xlsx")],
+            title="Save streamed EEG results",
+        )
+        if not output_path:
+            return
+
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "analyze-eeg",
+            "--input", input_file,
+            "--output", output_path,
+            "--bin-s", str(float(settings["eeg_bin_s"])),
+            "--chunk-s", "180",
+            "--stream-threshold-mb", "0",
+        ]
+        if settings["force_fs_enabled"]:
+            cmd.extend(["--force-fs", str(float(settings["force_fs_value"]))])
+
+        log_path = os.path.splitext(output_path)[0] + "_run.log"
+        self._batch_log_handle = open(log_path, "w", encoding="utf-8", errors="replace")
+        self._batch_log_path = log_path
+        self._batch_output_path = output_path
+        self._batch_proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=self._batch_log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+
+        self.is_analyzing = True
+        self.analyze_btn.config(state="disabled")
+        self.export_btn.config(state="disabled")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(12)
+        self.status.config(text="Large EEG analysis running in background...", fg="#1E88E5")
+        self._log(
+            "Large EEG analysis is running in a background Python process.\n"
+            f"Input: {input_file}\n"
+            f"Output: {output_path}\n"
+            f"Log: {log_path}\n\n"
+            "This can take a long time for multi-hour recordings."
+        )
+        self.root.after(3000, self._poll_large_eeg_analysis)
+
+    def _poll_large_eeg_analysis(self):
+        if self._batch_proc is None:
+            return
+        code = self._batch_proc.poll()
+        if code is None:
+            self.root.after(3000, self._poll_large_eeg_analysis)
+            return
+
+        self.progress.stop()
+        self.progress.config(mode="determinate")
+        self.progress["value"] = 100 if code == 0 else 0
+        if self._batch_log_handle is not None:
+            self._batch_log_handle.close()
+            self._batch_log_handle = None
+
+        if code == 0:
+            try:
+                summary_df = pd.read_excel(self._batch_output_path, sheet_name="EEG_Bins")
+                events_df = pd.read_excel(self._batch_output_path, sheet_name="EEG_Events")
+                meta_df = pd.read_excel(self._batch_output_path, sheet_name="Meta")
+                meta = meta_df.iloc[0].to_dict() if len(meta_df) else {}
+                self.results = {"mode": "EEG", "summary": summary_df,
+                                "events": events_df, "meta": meta}
+                self.export_btn.config(state="normal")
+                self.status.config(text=f"Large EEG complete: {os.path.basename(self._batch_output_path)}", fg="#43A047")
+                self._log(
+                    "=== EEG RESULTS ===\n"
+                    f"Recording duration : {float(meta.get('recording_duration_s', np.nan)):.1f} s\n"
+                    f"Sampling rate      : {float(meta.get('fs_Hz', np.nan)):.1f} Hz\n"
+                    f"Total spikes       : {int(meta.get('total_spikes', 0))}\n"
+                    f"Total SWDs         : {int(meta.get('total_SWDs', 0))}\n"
+                    f"Total seizures     : {int(meta.get('total_seizures', 0))}\n"
+                    f"Saved workbook     : {self._batch_output_path}"
+                )
+                messagebox.showinfo("Complete", f"Large EEG analysis complete.\nSaved to:\n{self._batch_output_path}")
+            except Exception as exc:
+                self.status.config(text=f"Analysis finished, but workbook reload failed: {exc}", fg="#FB8C00")
+                messagebox.showwarning("Reload failed", f"Analysis finished, but the workbook could not be reloaded:\n{exc}")
+        else:
+            tail = ""
+            try:
+                with open(self._batch_log_path, "r", encoding="utf-8", errors="replace") as f:
+                    tail = "".join(f.readlines()[-30:])
+            except Exception:
+                pass
+            self.status.config(text="Large EEG analysis failed.", fg="#E53935")
+            self._log(f"ERROR\nLarge EEG analysis failed with exit code {code}.\n\n{tail}")
+            messagebox.showerror("Analysis failed", f"Large EEG analysis failed.\nSee log:\n{self._batch_log_path}")
+
+        self.is_analyzing = False
+        self.analyze_btn.config(state="normal" if self.input_file else "disabled")
+        self._batch_proc = None
+
+    def _run_analysis(self, settings):
         try:
             self._set_progress(5, "Loading file (Col D/E, row 8+)…")
-            t, y = load_waveform_tabular(self.input_file)
+            input_file = settings["input_file"]
+            mode = settings["mode"]
+            debug = bool(settings["debug_plots"])
+            if mode == "EEG":
+                self._set_progress(5, "EEG: scanning waveform file")
+                bin_s = float(settings["eeg_bin_s"])
+                force_fs = float(settings["force_fs_value"]) if settings["force_fs_enabled"] else None
+                summary_df, events_df, meta = analyze_eeg_file(
+                    input_file,
+                    bin_s=bin_s,
+                    debug_plots=False,
+                    force_fs=force_fs,
+                    progress_callback=lambda pct, msg: self._set_progress(pct, msg),
+                )
+                self.results = {"mode": "EEG", "summary": summary_df,
+                                "events": events_df, "meta": meta}
+                self._set_progress(100,
+                    f"EEG complete - {meta['total_spikes']} spikes | "
+                    f"{meta['total_SWDs']} SWDs | {meta['total_seizures']} seizures.")
+
+                lines = ["=== EEG RESULTS ===",
+                         f"Recording duration : {meta['recording_duration_s']:.1f} s",
+                         f"Sampling rate      : {meta['fs_Hz']:.1f} Hz",
+                         f"Bin size           : {meta['bin_size_s']:.0f} s",
+                         f"Total spikes       : {meta['total_spikes']}",
+                         f"Total SWDs         : {meta['total_SWDs']}",
+                         f"Total seizures     : {meta['total_seizures']}",
+                         ""]
+                if len(events_df):
+                    swds = events_df[events_df["Type"] == "SWD"]
+                    szs = events_df[events_df["Type"] == "Seizure"]
+                    if len(swds):
+                        lines.append(f"  SWD duration (s)  mean={swds['Duration_s'].mean():.2f}  "
+                                     f"min={swds['Duration_s'].min():.2f}  max={swds['Duration_s'].max():.2f}")
+                    if len(szs):
+                        lines.append(f"  Seizure dur  (s)  mean={szs['Duration_s'].mean():.2f}  "
+                                     f"min={szs['Duration_s'].min():.2f}  max={szs['Duration_s'].max():.2f}")
+                    lines.append("")
+                    lines.append("--- Event list (first 20) ---")
+                    for _, row in events_df.head(20).iterrows():
+                        lines.append(f"  {row['Type']:<8}  "
+                                     f"start={row['Start_s']:>10.3f} s  "
+                                     f"end={row['End_s']:>10.3f} s  "
+                                     f"dur={row['Duration_s']:>7.3f} s  "
+                                     f"conf={row['Confidence']:.2f}")
+                self._log("\n".join(lines))
+                if debug:
+                    self.status.config(text="EEG debug plots are disabled for streamed analysis.", fg="#FB8C00")
+                self._ui_call(self.export_btn.config, state="normal")
+                self._ui_call(messagebox.showinfo,
+                              "Complete",
+                              "Analysis complete.\nClick Export Excel to save results.")
+                return
+            t, y = load_waveform_tabular(input_file)
 
             self._set_progress(15, "Inferring sampling rate…")
-            if self.force_fs_var.get():
-                fs_t = float(self.force_fs_entry.get().strip())
-                t, y, fs = ensure_uniform_sampling(t, y, fs_target=fs_t)
+            if settings["force_fs_enabled"]:
+                t, y, fs = ensure_uniform_sampling(t, y, fs_target=float(settings["force_fs_value"]))
             else:
                 t, y, fs = ensure_uniform_sampling(t, y)
 
-            mode  = self.mode_var.get()
-            debug = bool(self.debug_var.get())
+            mode  = settings["mode"]
+            debug = bool(settings["debug_plots"])
 
             if mode == "ECG":
                 self._set_progress(30, "ECG: filtering, R-peak detection, landmark refinement…")
-                engine = self.ecg_engine_var.get()
+                engine = settings["ecg_engine"]
                 beat_rows, meta = compute_ecg_metrics(t, y, fs,
                                                        engine=engine,
-                                                       debug_plots=debug,
-                                                       source_file=self.input_file,
+                                                       debug_plots=False,
+                                                       source_file=input_file,
                                                        validity_threshold=0.90,
                                                        run_context={
                                                            "ui_mode": "ECG",
-                                                           "force_fs": bool(self.force_fs_var.get()),
+                                                           "force_fs": bool(settings["force_fs_enabled"]),
                                                            "debug_plots": debug,
                                                        })
                 self.results = {"mode": "ECG", "beats": beat_rows, "meta": meta}
@@ -2219,14 +4382,16 @@ class UnifiedAnalyzerApp:
                 if np.isfinite(vr):
                     lines.append(f"  Validity      : {vr * 100:.2f}%  (threshold {vt:.1f}% -> {'PASS' if vp else 'FAIL'})")
                 self._log("\n".join(lines))
+                if debug:
+                    self._ui_call(self._show_ecg_debug_plots, y, fs, beat_rows)
 
             else:
                 self._set_progress(30, "EEG: preprocessing…")
-                bin_s = float(self.eeg_bin_entry.get().strip())
+                bin_s = float(settings["eeg_bin_s"])
                 self._set_progress(40, "EEG: spike / SWD / seizure detection…")
                 summary_df, events_df, meta = analyze_eeg(t, y, fs,
                                                            bin_s=bin_s,
-                                                           debug_plots=debug)
+                                                           debug_plots=False)
                 self.results = {"mode": "EEG", "summary": summary_df,
                                 "events": events_df, "meta": meta}
                 self._set_progress(100,
@@ -2259,18 +4424,21 @@ class UnifiedAnalyzerApp:
                                      f"dur={row['Duration_s']:>7.3f} s  "
                                      f"conf={row['Confidence']:.2f}")
                 self._log("\n".join(lines))
+                if debug:
+                    self._ui_call(self._show_eeg_debug_plots, t, y, fs, events_df)
 
-            self.export_btn.config(state="normal")
-            messagebox.showinfo("Complete",
-                                "Analysis complete.\nClick Export Excel to save results.")
+            self._ui_call(self.export_btn.config, state="normal")
+            self._ui_call(messagebox.showinfo,
+                          "Complete",
+                          "Analysis complete.\nClick Export Excel to save results.")
 
         except Exception as exc:
-            self._set_progress(0, f"Error: {exc}")
-            self._log(f"ERROR\n{exc}")
-            messagebox.showerror("Analysis failed", str(exc))
+            err = str(exc)
+            self._set_progress(0, f"Error: {err}")
+            self._log(f"ERROR\n{err}")
+            self._ui_call(messagebox.showerror, "Analysis failed", err)
         finally:
-            self.is_analyzing = False
-            self.analyze_btn.config(state="normal")
+            self._ui_call(self._finish_analysis_ui)
 
     def _export(self):
         if not self.results:
@@ -2301,6 +4469,13 @@ class UnifiedAnalyzerApp:
                 )
                 if open_now:
                     self._open_review_workbook(workbook_path=save_path)
+            elif mode == "EEG":
+                open_now = messagebox.askyesno(
+                    "Review EEG now?",
+                    "Do you want to open the manual EEG review tool for this workbook now?",
+                )
+                if open_now:
+                    self._open_eeg_review_workbook(workbook_path=save_path)
         except Exception as exc:
             messagebox.showerror("Export failed", str(exc))
 
@@ -2317,6 +4492,20 @@ class UnifiedAnalyzerApp:
             ECGReviewWindow(self.root, path)
         except Exception as exc:
             messagebox.showerror("ECG review failed", str(exc))
+
+    def _open_eeg_review_workbook(self, workbook_path=None):
+        path = workbook_path
+        if not path:
+            path = filedialog.askopenfilename(
+                title="Select exported EEG workbook to review",
+                filetypes=[("Excel", "*.xlsx"), ("All files", "*.*")],
+            )
+        if not path:
+            return
+        try:
+            EEGReviewWindow(self.root, path)
+        except Exception as exc:
+            messagebox.showerror("EEG review failed", str(exc))
 
     def _reset(self):
         self.input_file   = None
@@ -2380,6 +4569,267 @@ def cli_analyze_ecg(args):
     return 0 if passed else 2
 
 
+def cli_analyze_eeg(args):
+    input_path = os.path.abspath(args.input)
+    last_progress = {"pct": -10.0}
+
+    def _cli_progress(pct, msg):
+        if pct - last_progress["pct"] >= 5.0 or pct >= 95:
+            print(f"{float(pct):5.1f}%  {msg}", flush=True)
+            last_progress["pct"] = float(pct)
+
+    summary_df, events_df, meta = analyze_eeg_file(
+        input_path,
+        bin_s=float(args.bin_s),
+        debug_plots=bool(args.debug_plots),
+        force_fs=args.force_fs,
+        progress_callback=_cli_progress,
+        chunk_s=float(args.chunk_s),
+        streaming_threshold_mb=float(args.stream_threshold_mb),
+    )
+    meta["source_file"] = input_path
+    meta["ctx_cli_command"] = "analyze-eeg"
+    meta["ctx_force_fs"] = args.force_fs if args.force_fs is not None else ""
+    meta["ctx_debug_plots"] = bool(args.debug_plots)
+    benchmark_df = None
+    if args.manual_workbook:
+        manual_path = os.path.abspath(args.manual_workbook)
+        manual_df = parse_eeg_manual_counts(manual_path, sheet_name=args.manual_sheet)
+        benchmark_df, benchmark_meta = compare_eeg_counts_to_manual(summary_df, manual_df)
+        meta.update(benchmark_meta)
+        meta["eeg_benchmark_manual_workbook"] = manual_path
+        meta["eeg_benchmark_manual_sheet"] = args.manual_sheet
+
+    output_path = args.output
+    if not output_path:
+        stem = os.path.splitext(os.path.basename(input_path))[0]
+        output_path = os.path.join(os.path.dirname(input_path), f"{stem}_EEG_results.xlsx")
+    output_path = os.path.abspath(output_path)
+
+    if not args.no_export:
+        export_eeg_excel(output_path, summary_df, events_df, meta, benchmark_df=benchmark_df)
+
+    print("=== CLI EEG ANALYSIS ===")
+    print(f"Input            : {input_path}")
+    print(f"Sampling rate Hz : {float(meta.get('fs_Hz', np.nan)):.3f}")
+    print(f"Duration s       : {float(meta.get('recording_duration_s', np.nan)):.3f}")
+    print(f"Spikes           : {int(meta.get('total_spikes', 0))}")
+    print(f"SWDs             : {int(meta.get('total_SWDs', 0))}")
+    print(f"Seizures         : {int(meta.get('total_seizures', 0))}")
+    if benchmark_df is not None:
+        print(f"Manual workbook  : {meta.get('eeg_benchmark_manual_workbook')}")
+        print(f"Manual sheet     : {meta.get('eeg_benchmark_manual_sheet')}")
+        print(f"Bins compared    : {int(meta.get('eeg_benchmark_bins_compared', 0))}")
+        print(f"Manual spikes    : {int(meta.get('eeg_benchmark_manual_spikes', 0))}")
+        print(f"Manual SWDs      : {int(meta.get('eeg_benchmark_manual_swds', 0))}")
+        print(f"Manual seizures  : {int(meta.get('eeg_benchmark_manual_seizures', 0))}")
+        print(f"Total abs error  : {int(meta.get('eeg_benchmark_total_abs_error', 0))}")
+    if not args.no_export:
+        print(f"Workbook         : {output_path}")
+    return 0
+
+
+def cli_benchmark_eeg(args):
+    workbook = os.path.abspath(args.workbook)
+    manual_path = os.path.abspath(args.manual_workbook)
+    summary_df = pd.read_excel(workbook, sheet_name="EEG_Bins")
+    manual_df = parse_eeg_manual_counts(manual_path, sheet_name=args.manual_sheet)
+    benchmark_df, meta = compare_eeg_counts_to_manual(summary_df, manual_df)
+
+    if args.output:
+        output_path = os.path.abspath(args.output)
+        with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+            benchmark_df.to_excel(writer, index=False, sheet_name="EEG_Benchmark")
+            pd.DataFrame([meta | {
+                "workbook": workbook,
+                "manual_workbook": manual_path,
+                "manual_sheet": args.manual_sheet,
+            }]).to_excel(writer, index=False, sheet_name="Meta")
+    else:
+        output_path = ""
+
+    print("=== CLI EEG BENCHMARK ===")
+    print(f"Workbook         : {workbook}")
+    print(f"Manual workbook  : {manual_path}")
+    print(f"Manual sheet     : {args.manual_sheet}")
+    print(f"Bins compared    : {int(meta.get('eeg_benchmark_bins_compared', 0))}")
+    print(f"Program spikes   : {int(meta.get('eeg_benchmark_program_spikes', 0))}")
+    print(f"Manual spikes    : {int(meta.get('eeg_benchmark_manual_spikes', 0))}")
+    print(f"Program SWDs     : {int(meta.get('eeg_benchmark_program_swds', 0))}")
+    print(f"Manual SWDs      : {int(meta.get('eeg_benchmark_manual_swds', 0))}")
+    print(f"Program seizures : {int(meta.get('eeg_benchmark_program_seizures', 0))}")
+    print(f"Manual seizures  : {int(meta.get('eeg_benchmark_manual_seizures', 0))}")
+    print(f"Total abs error  : {int(meta.get('eeg_benchmark_total_abs_error', 0))}")
+    print(f"Exact bin match  : {float(meta.get('eeg_benchmark_exact_bin_match_ratio', np.nan)) * 100:.1f}%")
+    if output_path:
+        print(f"Benchmark output : {output_path}")
+    return 0
+
+
+def cli_debug_eeg(args):
+    workbook = os.path.abspath(args.workbook)
+    summary_df, events_df, meta = load_eeg_workbook(workbook)
+    source_file = os.path.abspath(args.source_file) if args.source_file else str(meta.get("source_file", "")).strip()
+    if not source_file:
+        raise ValueError("debug-eeg needs --source-file or a source_file value in the workbook Meta sheet.")
+    if not os.path.exists(source_file):
+        raise FileNotFoundError(f"Source waveform file not found: {source_file}")
+
+    fs_hint = args.force_fs
+    if fs_hint is None:
+        fs_hint = pd.to_numeric(pd.Series([meta.get("fs_Hz", np.nan)]), errors="coerce").iloc[0]
+        fs_hint = float(fs_hint) if np.isfinite(fs_hint) else None
+
+    benchmark_df = None
+    benchmark_meta = {}
+    if args.manual_workbook:
+        manual_path = os.path.abspath(args.manual_workbook)
+        manual_df = parse_eeg_manual_counts(manual_path, sheet_name=args.manual_sheet)
+        benchmark_df, benchmark_meta = compare_eeg_counts_to_manual(summary_df, manual_df)
+    else:
+        manual_path = ""
+
+    out_dir = args.output_dir
+    if not out_dir:
+        stem = os.path.splitext(os.path.basename(workbook))[0]
+        out_dir = os.path.join(os.path.dirname(workbook), f"{stem}_debug")
+    out_dir = os.path.abspath(out_dir)
+    plot_dir = os.path.join(out_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    if benchmark_df is not None:
+        save_eeg_benchmark_plot(benchmark_df, os.path.join(plot_dir, "benchmark_counts.png"))
+
+    debug_windows = build_eeg_debug_windows(
+        summary_df,
+        events_df,
+        benchmark_df,
+        source_file,
+        fs_hint,
+        event_pad_s=float(args.event_pad_s),
+        max_plots=int(args.max_plots),
+        candidate_window_s=float(args.candidate_window_s),
+        candidate_step_s=float(args.candidate_step_s),
+        candidate_count=int(args.candidate_count),
+    )
+
+    plot_rows = []
+    for i, row in debug_windows.iterrows():
+        label = _safe_filename(
+            f"{i + 1:03d}_{row['Reason']}_bin{row['Bin_Index']}_{float(row['Start_s']):.1f}s"
+        )
+        png_path = os.path.join(plot_dir, f"{label}.png")
+        title = (
+            f"{row['Reason']} | bin={row['Bin_Index']} | "
+            f"{float(row['Start_s']):.2f}-{float(row['End_s']):.2f} s"
+        )
+        status = "ok"
+        error = ""
+        try:
+            save_eeg_debug_plot(
+                source_file,
+                events_df,
+                png_path,
+                float(row["Start_s"]),
+                float(row["End_s"]),
+                fs_hint=fs_hint,
+                title=title,
+                manual_note=str(row.get("Manual_Note", "")),
+            )
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+            png_path = ""
+        out_row = row.to_dict()
+        out_row["Plot_File"] = png_path
+        out_row["Status"] = status
+        out_row["Error"] = error
+        plot_rows.append(out_row)
+    debug_windows = pd.DataFrame(plot_rows)
+
+    summary_meta = {
+        "workbook": workbook,
+        "source_file": source_file,
+        "manual_workbook": manual_path,
+        "manual_sheet": args.manual_sheet if args.manual_workbook else "",
+        "output_dir": out_dir,
+        "plot_dir": plot_dir,
+        "fs_hint": fs_hint if fs_hint is not None else "",
+        "debug_plots_requested": int(args.max_plots),
+        "debug_plots_created": int((debug_windows.get("Status", pd.Series(dtype=str)) == "ok").sum()) if len(debug_windows) else 0,
+        "generated_at": now_iso(),
+    }
+    summary_meta.update(benchmark_meta)
+
+    out_xlsx = os.path.join(out_dir, "eeg_debug_summary.xlsx")
+    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+        pd.DataFrame([summary_meta]).to_excel(writer, index=False, sheet_name="Meta")
+        summary_df.to_excel(writer, index=False, sheet_name="EEG_Bins")
+        events_df.to_excel(writer, index=False, sheet_name="EEG_Events")
+        if benchmark_df is not None:
+            benchmark_df.to_excel(writer, index=False, sheet_name="Benchmark")
+        debug_windows.to_excel(writer, index=False, sheet_name="Debug_Windows")
+
+    print("=== CLI EEG DEBUG ===")
+    print(f"Workbook         : {workbook}")
+    print(f"Source file      : {source_file}")
+    if manual_path:
+        print(f"Manual workbook  : {manual_path}")
+        print(f"Manual sheet     : {args.manual_sheet}")
+        print(f"Total abs error  : {int(benchmark_meta.get('eeg_benchmark_total_abs_error', 0))}")
+    print(f"Output dir       : {out_dir}")
+    print(f"Plots created    : {summary_meta['debug_plots_created']}/{len(debug_windows)}")
+    print(f"Summary workbook : {out_xlsx}")
+    return 0
+
+
+def cli_review_eeg(args):
+    workbook = os.path.abspath(args.workbook)
+    summary_df, events_df, meta = load_eeg_workbook(workbook)
+    if args.source_file:
+        meta["source_file"] = os.path.abspath(args.source_file)
+
+    bin_s = pd.to_numeric(pd.Series([meta.get("bin_size_s", np.nan)]), errors="coerce").iloc[0]
+    if not (np.isfinite(bin_s) and bin_s > 0):
+        bin_s = 3600.0
+    if len(summary_df) and {"Bin_Start_s", "Bin_End_s"}.issubset(summary_df.columns):
+        t0 = float(pd.to_numeric(summary_df["Bin_Start_s"], errors="coerce").min())
+        t1 = float(pd.to_numeric(summary_df["Bin_End_s"], errors="coerce").max())
+    else:
+        t0 = 0.0
+        rec_dur = pd.to_numeric(pd.Series([meta.get("recording_duration_s", np.nan)]), errors="coerce").iloc[0]
+        t1 = float(rec_dur) if np.isfinite(rec_dur) and rec_dur > 0 else float(bin_s)
+    summary_df = recompute_eeg_bins_from_events(events_df, float(bin_s), t0=t0, t1=t1)
+    meta = update_eeg_meta_from_events(meta, events_df, summary_df)
+
+    output_path = os.path.abspath(args.output) if args.output else workbook
+    should_save = bool(args.save or args.output)
+    if should_save:
+        meta["review_last_saved_at"] = now_iso()
+        meta["review_source"] = "cli_eeg_review_recompute"
+        export_eeg_excel(output_path, summary_df, events_df, meta)
+
+    print("=== CLI EEG REVIEW ===")
+    print(f"Workbook         : {workbook}")
+    print(f"Active spikes    : {int(meta.get('total_spikes', 0))}")
+    print(f"Active SWDs      : {int(meta.get('total_SWDs', 0))}")
+    print(f"Active seizures  : {int(meta.get('total_seizures', 0))}")
+    print(f"Corrected events : {int(events_df['Is_Corrected'].apply(_to_bool).sum()) if len(events_df) else 0}")
+    print(f"Deleted events   : {int(events_df['Is_Deleted'].apply(_to_bool).sum()) if len(events_df) else 0}")
+    if should_save:
+        print(f"Saved workbook   : {output_path}")
+    return 0
+
+
+def cli_review_eeg_ui(args):
+    workbook = os.path.abspath(args.workbook)
+    root = tk.Tk()
+    root.withdraw()
+    EEGReviewWindow(root, workbook)
+    root.mainloop()
+    return 0
+
+
 def cli_review_ecg(args):
     workbook = os.path.abspath(args.workbook)
     beats_df, meta = load_ecg_workbook(workbook)
@@ -2439,7 +4889,7 @@ def cli_review_ecg_ui(args):
 
 def build_cli_parser():
     parser = argparse.ArgumentParser(
-        description="SUDEP EEG/ECG analyzer - GUI and batch ECG utilities"
+        description="SUDEP EEG/ECG analyzer - GUI and batch utilities"
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -2453,6 +4903,53 @@ def build_cli_parser():
                       help="Minimum valid-beat ratio required to pass")
     p_an.add_argument("--debug-plots", action="store_true", help="Show debug landmark plots")
     p_an.add_argument("--no-export", action="store_true", help="Run analysis without writing workbook")
+
+    p_eeg = sub.add_parser("analyze-eeg", help="Run EEG analysis and export workbook")
+    p_eeg.add_argument("--input", required=True, help="Input EEG waveform file")
+    p_eeg.add_argument("--output", default="", help="Output workbook path (.xlsx)")
+    p_eeg.add_argument("--bin-s", type=float, default=3600.0, help="Summary bin size in seconds")
+    p_eeg.add_argument("--force-fs", type=float, default=None, help="Force target sampling rate Hz")
+    p_eeg.add_argument("--chunk-s", type=float, default=180.0, help="Streaming chunk size in seconds")
+    p_eeg.add_argument("--stream-threshold-mb", type=float, default=128.0,
+                       help="Use streaming for files at or above this size")
+    p_eeg.add_argument("--manual-workbook", default="",
+                       help="Optional manual EEG count workbook for benchmark comparison")
+    p_eeg.add_argument("--manual-sheet", default="Baseline",
+                       help="Manual EEG workbook sheet name")
+    p_eeg.add_argument("--debug-plots", action="store_true", help="Show debug plots for small files")
+    p_eeg.add_argument("--no-export", action="store_true", help="Run analysis without writing workbook")
+
+    p_bench_eeg = sub.add_parser("benchmark-eeg", help="Compare an EEG output workbook to manual counts")
+    p_bench_eeg.add_argument("--workbook", required=True, help="Existing EEG output workbook")
+    p_bench_eeg.add_argument("--manual-workbook", required=True, help="Manual EEG count workbook")
+    p_bench_eeg.add_argument("--manual-sheet", default="Baseline", help="Manual EEG workbook sheet name")
+    p_bench_eeg.add_argument("--output", default="", help="Optional benchmark workbook output path")
+
+    p_dbg_eeg = sub.add_parser("debug-eeg", help="Export targeted EEG debug plots from an EEG workbook")
+    p_dbg_eeg.add_argument("--workbook", required=True, help="Existing EEG output workbook")
+    p_dbg_eeg.add_argument("--source-file", default="", help="Override waveform source file")
+    p_dbg_eeg.add_argument("--manual-workbook", default="", help="Manual EEG count workbook")
+    p_dbg_eeg.add_argument("--manual-sheet", default="Baseline", help="Manual EEG workbook sheet name")
+    p_dbg_eeg.add_argument("--output-dir", default="", help="Folder for debug plots and summary workbook")
+    p_dbg_eeg.add_argument("--force-fs", type=float, default=None, help="Force sampling rate Hz for window reads")
+    p_dbg_eeg.add_argument("--max-plots", type=int, default=40, help="Maximum debug windows to plot")
+    p_dbg_eeg.add_argument("--event-pad-s", type=float, default=5.0, help="Seconds added around program events")
+    p_dbg_eeg.add_argument("--candidate-window-s", type=float, default=20.0,
+                           help="Candidate window length for missed manual seizure bins")
+    p_dbg_eeg.add_argument("--candidate-step-s", type=float, default=60.0,
+                           help="Candidate scan step for missed manual seizure bins")
+    p_dbg_eeg.add_argument("--candidate-count", type=int, default=2,
+                           help="Candidate windows per missed manual seizure bin")
+
+    p_rev_eeg = sub.add_parser("review-eeg", help="Recompute/revalidate an exported EEG workbook")
+    p_rev_eeg.add_argument("--workbook", required=True, help="Existing EEG workbook path")
+    p_rev_eeg.add_argument("--output", default="", help="Output workbook path (defaults to overwrite input)")
+    p_rev_eeg.add_argument("--source-file", default="", help="Override source file path in meta")
+    p_rev_eeg.add_argument("--save", action="store_true",
+                           help="Save workbook after recomputing corrected/deleted event counts")
+
+    p_ui_eeg = sub.add_parser("review-eeg-ui", help="Launch manual EEG review UI for a workbook")
+    p_ui_eeg.add_argument("--workbook", required=True, help="Existing EEG workbook path")
 
     p_rev = sub.add_parser("review-ecg", help="Recompute/revalidate an exported ECG workbook")
     p_rev.add_argument("--workbook", required=True, help="Existing ECG workbook path")
@@ -2478,6 +4975,16 @@ def run_cli(argv=None):
         return None
     if args.command == "analyze-ecg":
         return cli_analyze_ecg(args)
+    if args.command == "analyze-eeg":
+        return cli_analyze_eeg(args)
+    if args.command == "benchmark-eeg":
+        return cli_benchmark_eeg(args)
+    if args.command == "debug-eeg":
+        return cli_debug_eeg(args)
+    if args.command == "review-eeg":
+        return cli_review_eeg(args)
+    if args.command == "review-eeg-ui":
+        return cli_review_eeg_ui(args)
     if args.command == "review-ecg":
         return cli_review_ecg(args)
     if args.command == "review-ecg-ui":
