@@ -3,6 +3,8 @@ import sys
 
 
 def _relaunch_with_project_python():
+    if getattr(sys, "frozen", False):
+        return
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_python = os.path.join(script_dir, ".venv", "Scripts", "python.exe")
     if not os.path.exists(project_python):
@@ -24,6 +26,7 @@ import json
 import argparse
 import threading
 import subprocess
+import shutil
 import pathlib
 import warnings
 from datetime import datetime
@@ -84,14 +87,71 @@ EEG_EVENT_COLUMNS = [
     "Correction_Notes",
 ]
 
-CORRECTION_STORE_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "ecg_corrections_v2.json",
-)
-EEG_CORRECTION_STORE_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "eeg_corrections_v1.json",
-)
+APP_NAME = "EEG_ECG_Analyser"
+
+
+def app_resource_dir():
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def user_data_dir():
+    if sys.platform == "darwin":
+        root = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    elif os.name == "nt":
+        root = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Roaming")
+    else:
+        root = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    path = os.path.join(root, APP_NAME)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def bundled_resource_path(filename):
+    candidates = [
+        os.path.join(app_resource_dir(), filename),
+        os.path.join(os.path.dirname(os.path.abspath(sys.executable)), filename),
+        os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "..", "Resources", filename),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), filename),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+    return candidates[0]
+
+
+def seed_user_data_file(filename):
+    dst = os.path.join(user_data_dir(), filename)
+    if os.path.exists(dst):
+        return dst
+    src = bundled_resource_path(filename)
+    if os.path.exists(src):
+        try:
+            shutil.copy2(src, dst)
+        except Exception:
+            pass
+    return dst
+
+
+def ensure_frozen_stdio():
+    if not getattr(sys, "frozen", False):
+        return
+    log_dir = user_data_dir()
+    try:
+        if sys.stdout is None:
+            sys.stdout = open(os.path.join(log_dir, "last_stdout.log"), "a", encoding="utf-8", buffering=1)
+        if sys.stderr is None:
+            sys.stderr = open(os.path.join(log_dir, "last_stderr.log"), "a", encoding="utf-8", buffering=1)
+    except Exception:
+        pass
+
+
+ensure_frozen_stdio()
+
+
+CORRECTION_STORE_FILE = seed_user_data_file("ecg_corrections_v2.json")
+EEG_CORRECTION_STORE_FILE = seed_user_data_file("eeg_corrections_v1.json")
 
 
 # ============================================================
@@ -445,6 +505,7 @@ def _convert_legacy_store(data):
 def load_correction_store(path=CORRECTION_STORE_FILE):
     candidates = [path]
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(bundled_resource_path("ecg_corrections_v2.json"))
     candidates.append(os.path.join(script_dir, "ecg_correction_memory.json"))
     candidates.append(os.path.join(os.path.expanduser("~"), "ecg_correction_memory.json"))
 
@@ -2428,7 +2489,7 @@ def ensure_eeg_events_schema(events_df):
     for col in ["Is_Corrected", "Is_Deleted"]:
         if col not in df.columns:
             df[col] = False
-        df[col] = df[col].apply(_to_bool)
+        df[col] = df[col].apply(_to_bool).astype(bool)
     for col in ["Corrected_At", "Correction_Source", "Correction_Notes"]:
         if col not in df.columns:
             df[col] = ""
@@ -2487,21 +2548,23 @@ def _eeg_source_key(source_file):
 
 
 def load_eeg_correction_store(path=EEG_CORRECTION_STORE_FILE):
-    if not os.path.exists(path):
-        return _default_eeg_correction_store()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return _default_eeg_correction_store()
-        data.setdefault("version", 1)
-        data.setdefault("updated_at", now_iso())
-        data.setdefault("sources", {})
-        if not isinstance(data["sources"], dict):
-            data["sources"] = {}
-        return data
-    except Exception:
-        return _default_eeg_correction_store()
+    for candidate in [path, bundled_resource_path("eeg_corrections_v1.json")]:
+        if not candidate or not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            data.setdefault("version", 1)
+            data.setdefault("updated_at", now_iso())
+            data.setdefault("sources", {})
+            if not isinstance(data["sources"], dict):
+                data["sources"] = {}
+            return data
+        except Exception:
+            continue
+    return _default_eeg_correction_store()
 
 
 def save_eeg_correction_store(store, path=EEG_CORRECTION_STORE_FILE):
@@ -2648,7 +2711,8 @@ def apply_eeg_saved_corrections(source_file, events_df, t0=None, t1=None):
 
 def active_eeg_events(events_df):
     df = ensure_eeg_events_schema(events_df)
-    return df[~df["Is_Deleted"].apply(_to_bool)].copy()
+    deleted = df["Is_Deleted"].apply(_to_bool).astype(bool)
+    return df.loc[~deleted].copy()
 
 
 def recompute_eeg_bins_from_events(events_df, bin_s, t0=0.0, t1=None):
