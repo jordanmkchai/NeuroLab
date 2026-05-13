@@ -69,7 +69,7 @@ ECG_INTERVAL_COLUMNS_MS = [
     "PR_interval_ms",
     "QRS_interval_ms",
     "QT_interval_ms",
-    "QTc_Bazett_ms",
+    "QTc_Mitchell_ms",
 ]
 
 EEG_EVENT_TYPES = ["Spike", "SWD", "Seizure"]
@@ -288,13 +288,30 @@ def ensure_ecg_beats_schema(df: pd.DataFrame):
         "PR_interval_s", "PR_interval_ms",
         "QRS_interval_s", "QRS_interval_ms",
         "QT_interval_s", "QT_interval_ms",
-        "QTc_Bazett_s", "QTc_Bazett_ms",
+        "QTc_Mitchell_s", "QTc_Mitchell_ms",
         "Confidence", "Confidence_Rank",
     ]
     for col in float_cols:
         if col not in df.columns:
             df[col] = np.nan
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["QTc_Bazett_s", "QTc_Bazett_ms"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    qt_ms = pd.to_numeric(df.get("QT_interval_ms", np.nan), errors="coerce")
+    rr_ms = pd.to_numeric(df.get("RR_ms", np.nan), errors="coerce")
+    mitchell_ms = np.where(
+        np.isfinite(qt_ms) & np.isfinite(rr_ms) & (rr_ms > 0),
+        qt_ms / np.sqrt(rr_ms / 100.0),
+        np.nan,
+    )
+    needs_mitchell = ~np.isfinite(pd.to_numeric(df["QTc_Mitchell_ms"], errors="coerce"))
+    df.loc[needs_mitchell, "QTc_Mitchell_ms"] = mitchell_ms[needs_mitchell]
+    df["QTc_Mitchell_s"] = np.where(
+        np.isfinite(df["QTc_Mitchell_ms"]),
+        df["QTc_Mitchell_ms"] / 1000.0,
+        df["QTc_Mitchell_s"],
+    )
 
     if "Is_Corrected" not in df.columns:
         df["Is_Corrected"] = False
@@ -357,9 +374,9 @@ def recompute_ecg_intervals_df(df: pd.DataFrame, fs_hz: float):
         (t_off - qrs_on) / fs_hz,
         np.nan,
     )
-    qtc_b = np.where(
+    qtc_m = np.where(
         np.isfinite(qt) & np.isfinite(rr) & (rr > 0),
-        qt / np.sqrt(rr),
+        qt / np.sqrt(rr * 10.0),
         np.nan,
     )
 
@@ -374,8 +391,12 @@ def recompute_ecg_intervals_df(df: pd.DataFrame, fs_hz: float):
     df["QRS_interval_ms"] = ms(qrs)
     df["QT_interval_s"] = qt
     df["QT_interval_ms"] = ms(qt)
-    df["QTc_Bazett_s"] = qtc_b
-    df["QTc_Bazett_ms"] = ms(qtc_b)
+    df["QTc_Mitchell_s"] = qtc_m
+    df["QTc_Mitchell_ms"] = ms(qtc_m)
+    if "QTc_Bazett_s" in df.columns:
+        df.drop(columns=["QTc_Bazett_s"], inplace=True)
+    if "QTc_Bazett_ms" in df.columns:
+        df.drop(columns=["QTc_Bazett_ms"], inplace=True)
 
     rr_clean = rr[np.isfinite(rr) & (rr > 0)]
     rmssd = float(np.sqrt(np.mean(np.diff(rr_clean) ** 2))) if rr_clean.size >= 3 else np.nan
@@ -390,7 +411,7 @@ def recompute_ecg_intervals_df(df: pd.DataFrame, fs_hz: float):
 
 def compute_ecg_validity(df: pd.DataFrame):
     df = ensure_ecg_beats_schema(df)
-    required = ["PR_interval_ms", "QRS_interval_ms", "QT_interval_ms", "RR_ms", "QTc_Bazett_ms"]
+    required = ["PR_interval_ms", "QRS_interval_ms", "QT_interval_ms", "RR_ms", "QTc_Mitchell_ms"]
     for col in required:
         if col not in df.columns:
             df[col] = np.nan
@@ -1237,7 +1258,7 @@ def compute_ecg_metrics(
     PR    = np.where(np.isfinite(P_on)   & np.isfinite(QRS_on),  (QRS_on - P_on)   / fs, np.nan)
     QRS   = np.where(np.isfinite(QRS_on) & np.isfinite(QRS_off), (QRS_off- QRS_on) / fs, np.nan)
     QT    = np.where(np.isfinite(QRS_on) & np.isfinite(T_off),   (T_off  - QRS_on) / fs, np.nan)
-    QTcB  = np.where(np.isfinite(QT) & np.isfinite(rr) & (rr > 0), QT / np.sqrt(rr), np.nan)
+    QTcM  = np.where(np.isfinite(QT) & np.isfinite(rr) & (rr > 0), QT / np.sqrt(rr * 10.0), np.nan)
 
     conf_rank = pd.Series(np.where(np.isfinite(conf), conf, np.inf)).rank(
         method="dense", ascending=True
@@ -1274,8 +1295,8 @@ def compute_ecg_metrics(
             "QRS_interval_ms":   ms(QRS[i]),
             "QT_interval_s":     float(QT[i])     if np.isfinite(QT[i])     else np.nan,
             "QT_interval_ms":    ms(QT[i]),
-            "QTc_Bazett_s":      float(QTcB[i])   if np.isfinite(QTcB[i])   else np.nan,
-            "QTc_Bazett_ms":     ms(QTcB[i]),
+            "QTc_Mitchell_s":    float(QTcM[i])   if np.isfinite(QTcM[i])   else np.nan,
+            "QTc_Mitchell_ms":   ms(QTcM[i]),
             "Confidence":        float(conf[i])   if np.isfinite(conf[i])   else np.nan,
             "Confidence_Rank":   float(conf_rank[i]) if np.isfinite(conf[i]) else np.nan,
             "Is_Corrected":      False,
@@ -1331,6 +1352,8 @@ def compute_ecg_metrics(
         "total_beats":      N,
         "RMSSD_s":          rmssd,
         "RMSSD_ms":         rmssd * 1000 if np.isfinite(rmssd) else np.nan,
+        "qtc_formula":      "Mitchell",
+        "qtc_formula_detail": "QTc_Mitchell_ms = QT_interval_ms / sqrt(RR_ms / 100)",
         "generated_at":     now_iso(),
         "source_file":      os.path.abspath(source_file) if source_file else "",
         "validity_threshold": float(validity_threshold),
@@ -2303,6 +2326,8 @@ def export_ecg_excel(save_path, beat_rows, meta):
         meta["RMSSD_ms"] = rmssd_s * 1000 if np.isfinite(rmssd_s) else np.nan
 
     valid_ratio, valid_count, total_count = compute_ecg_validity(df)
+    meta["qtc_formula"] = "Mitchell"
+    meta["qtc_formula_detail"] = "QTc_Mitchell_ms = QT_interval_ms / sqrt(RR_ms / 100)"
     meta["validity_ratio"] = valid_ratio
     meta["valid_beats"] = valid_count
     meta["valid_beats_total"] = total_count
@@ -2313,12 +2338,13 @@ def export_ecg_excel(save_path, beat_rows, meta):
     meta.setdefault("source_file", "")
     meta.setdefault("review_last_saved_at", "")
     summary = compute_ecg_summary_row(df, meta)
+    df.drop(columns=["QTc_Bazett_s", "QTc_Bazett_ms"], inplace=True, errors="ignore")
 
     preferred = [
         "Beat_Index",
         "R_idx", "P_on_idx", "P_off_idx", "QRS_on_idx", "QRS_off_idx", "T_off_idx",
         "R_time_s",
-        "RR_ms", "P_wave_dur_ms", "PR_interval_ms", "QRS_interval_ms", "QT_interval_ms", "QTc_Bazett_ms",
+        "RR_ms", "P_wave_dur_ms", "PR_interval_ms", "QRS_interval_ms", "QT_interval_ms", "QTc_Mitchell_ms",
         "Confidence", "Confidence_Rank",
         "Is_Corrected", "Corrected_At", "Correction_Source", "Correction_Notes",
     ]
@@ -3268,7 +3294,7 @@ class ECGReviewWindow(tk.Toplevel):
             f"Confidence={conf:.3f} Rank={rank:.0f} | "
             f"RR={row.get('RR_ms', np.nan):.2f} ms  PR={row.get('PR_interval_ms', np.nan):.2f} ms  "
             f"QRS={row.get('QRS_interval_ms', np.nan):.2f} ms  QT={row.get('QT_interval_ms', np.nan):.2f} ms  "
-            f"QTcB={row.get('QTc_Bazett_ms', np.nan):.2f} ms | "
+            f"QTcM={row.get('QTc_Mitchell_ms', np.nan):.2f} ms | "
             f"Valid beats={valid}/{total} ({valid_pct})"
         )
 
@@ -4430,7 +4456,7 @@ class UnifiedAnalyzerApp:
                     ("PR_interval_ms",  "PR interval   (ms)"),
                     ("QRS_interval_ms", "QRS interval  (ms)"),
                     ("QT_interval_ms",  "QT interval   (ms)"),
-                    ("QTc_Bazett_ms",   "QTc Bazett    (ms)"),
+                    ("QTc_Mitchell_ms", "QTc Mitchell  (ms)"),
                 ]:
                     if col in df.columns:
                         v = df[col].dropna()
