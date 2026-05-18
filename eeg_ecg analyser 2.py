@@ -169,14 +169,10 @@ def load_waveform_tabular(file_path: str):
         ).values
 
     if ext in ['.tsv', '.txt', '.csv']:
-        sep = '\t' if ext in ['.tsv', '.txt'] else ','
-        try:
-            df = pd.read_csv(file_path, sep=sep, header=None,
-                             skiprows=7, usecols=[3, 4], engine='c',
-                             on_bad_lines='skip')
-        except Exception:
-            df = pd.read_csv(file_path, sep=None, header=None,
-                             skiprows=7, usecols=[3, 4], engine='python')
+        rows = list(_iter_numeric_waveform_rows(file_path))
+        if not rows:
+            raise ValueError("No valid numeric data in columns D & E.")
+        df = pd.DataFrame(rows, columns=[3, 4])
     elif ext in ['.xlsx', '.xls']:
         engine = 'openpyxl' if ext == '.xlsx' else 'xlrd'
         df = pd.read_excel(file_path, engine=engine, header=None,
@@ -195,6 +191,27 @@ def load_waveform_tabular(file_path: str):
     if len(t) == 0:
         raise ValueError("No valid numeric data in columns D & E (row 8+).")
     return t, y
+
+
+def _iter_numeric_waveform_rows(file_path):
+    """Yield numeric time/signal pairs from ragged Axion-style text exports."""
+    path = pathlib.Path(file_path)
+    sep = "\t" if path.suffix.lower() in [".tsv", ".txt"] else ","
+
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+        for line in file:
+            parts = line.rstrip("\r\n").split(sep)
+            if len(parts) <= 4:
+                continue
+
+            try:
+                time_value = float(parts[3].strip())
+                signal_value = float(parts[4].strip())
+            except (TypeError, ValueError):
+                continue
+
+            if np.isfinite(time_value) and np.isfinite(signal_value):
+                yield time_value, signal_value
 
 
 # ============================================================
@@ -2039,29 +2056,21 @@ def iter_waveform_tabular_chunks(file_path, chunk_rows=600000):
         yield t, y
         return
 
-    sep = "\t" if ext in [".tsv", ".txt"] else ","
-    reader = pd.read_csv(
-        file_path,
-        sep=sep,
-        header=None,
-        skiprows=7,
-        usecols=[3, 4],
-        chunksize=int(chunk_rows),
-        engine="c",
-        on_bad_lines="skip",
-    )
-    for df in reader:
-        t = pd.to_numeric(
-            df.iloc[:, 0].astype(str).str.strip().str.replace(r"[^0-9eE+\-\.]", "", regex=True),
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        y = pd.to_numeric(
-            df.iloc[:, 1].astype(str).str.strip().str.replace(r"[^0-9eE+\-\.]", "", regex=True),
-            errors="coerce",
-        ).to_numpy(dtype=float)
-        valid = np.isfinite(t) & np.isfinite(y)
-        if np.any(valid):
-            yield t[valid], y[valid]
+    t_values = []
+    y_values = []
+    chunk_rows = int(chunk_rows)
+
+    for time_value, signal_value in _iter_numeric_waveform_rows(file_path):
+        t_values.append(time_value)
+        y_values.append(signal_value)
+
+        if len(t_values) >= chunk_rows:
+            yield np.asarray(t_values, dtype=float), np.asarray(y_values, dtype=float)
+            t_values = []
+            y_values = []
+
+    if t_values:
+        yield np.asarray(t_values, dtype=float), np.asarray(y_values, dtype=float)
 
 
 def _events_from_eeg_detection(spike_times, swd_events, sz_events):
