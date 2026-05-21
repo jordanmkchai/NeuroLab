@@ -4277,16 +4277,19 @@ class UnifiedAnalyzerApp:
         if not output_path:
             return
 
-        cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "analyze-eeg",
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "analyze-eeg"]
+            proc_cwd = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            cmd = [sys.executable, os.path.abspath(__file__), "analyze-eeg"]
+            proc_cwd = os.path.dirname(os.path.abspath(__file__))
+        cmd.extend([
             "--input", input_file,
             "--output", output_path,
             "--bin-s", str(float(settings["eeg_bin_s"])),
             "--chunk-s", "180",
             "--stream-threshold-mb", "0",
-        ]
+        ])
         if settings["force_fs_enabled"]:
             cmd.extend(["--force-fs", str(float(settings["force_fs_value"]))])
 
@@ -4296,7 +4299,7 @@ class UnifiedAnalyzerApp:
         self._batch_output_path = output_path
         self._batch_proc = subprocess.Popen(
             cmd,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            cwd=proc_cwd,
             stdout=self._batch_log_handle,
             stderr=subprocess.STDOUT,
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
