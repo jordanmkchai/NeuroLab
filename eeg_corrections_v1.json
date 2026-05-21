@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-05-05T14:25:40",
+  "updated_at": "2026-05-21T17:54:10",
   "sources": {
     "d:\\data\\scn1a r1407x\\female\\#917 het\\917_eeg test.tsv": {
       "source_file": "D:\\Data\\SCN1A R1407X\\Female\\#917 Het\\917_eeg test.tsv",
@@ -534,6 +534,145 @@
           "Correction_Notes": "corrected",
           "Correction_Source": "manual_review",
           "Corrected_At": "2026-05-05T14:12:56"
+        }
+      ]
+    },
+    "d:\\for jordan\\cux2 1180 r8 04-12-2024_export.tsv": {
+      "source_file": "D:\\For Jordan\\CUX2 1180 R8 04-12-2024_export.tsv",
+      "workbook_path": "D:\\For Jordan\\CUX2 1180 R8 04-12-2024_export_EEG_results.xlsx",
+      "saved_at": "2026-05-21T17:54:10",
+      "events": [
+        {
+          "Event_Index": 50,
+          "Type": "Spike",
+          "Start_s": 341.3674,
+          "End_s": 341.3674,
+          "Duration_s": 0.0,
+          "Confidence": null,
+          "Is_Deleted": false,
+          "Correction_Notes": "corrected",
+          "Correction_Source": "manual_review_dedupe",
+          "Corrected_At": "2026-05-21T17:54:10"
+        },
+        {
+          "Event_Index": 49,
+          "Type": "SWD",
+          "Start_s": 3691.5576,
+          "End_s": 3692.6454,
+          "Duration_s": 1.0877999999997883,
+          "Confidence": null,
+          "Is_Deleted": false,
+          "Correction_Notes": "SWD",
+          "Correction_Source": "manual_review_dedupe",
+          "Corrected_At": "2026-05-21T17:53:55"
+        },
+        {
+          "Event_Index": 48,
+          "Type": "SWD",
+          "Start_s": 4507.8016,
+          "End_s": 4508.708,
+          "Duration_s": 0.9063999999998487,
+          "Confidence": null,
+          "Is_Deleted": false,
+          "Correction_Notes": "SWD",
+          "Correction_Source": "manual_review_dedupe",
+          "Corrected_At": "2026-05-21T17:53:55"
+        },
+        {
+          "Event_Index": 47,
+          "Type": "SWD",
+          "Start_s": 4612.634,
+          "End_s": 4613.2238,
+          "Duration_s": 0.589799999999741,
+          "Confidence": null,
+          "Is_Deleted": false,
+          "Correction_Notes": "SWD",
+          "Correction_Source": "manual_review_dedupe",
+          "Corrected_At": "2026-05-21T17:53:55"
+        },
+        {
+          "Event_Index": 14,
+          "Type": "Seizure",
+          "Start_s": 6283.504999856977,
+          "End_s": 6300.004999854496,
+          "Duration_s": 16.499999997519808,
+          "Confidence": 0.75,
+          "Is_Deleted": true,
+          "Correction_Notes": "corrected",
+          "Correction_Source": "manual_review",
+          "Corrected_At": "2026-05-21T17:50:13"
+        },
+        {
+          "Event_Index": 26,
+          "Type": "Seizure",
+          "Start_s": 11714.99500000509,
+          "End_s": 11720.16000000594,
+          "Duration_s": 5.165000000850341,
+          "Confidence": 0.75,
+          "Is_Deleted": true,
+          "Correction_Notes": "corrected",
+          "Correction_Source": "manual_review",
+          "Corrected_At": "2026-05-21T17:52:19"
+        },
+        {
+          "Event_Index": 27,
+          "Type": "Seizure",
+          "Start_s": 12587.44000018283,
+          "End_s": 12599.95500018518,
+          "Duration_s": 12.515000002349552,
+          "Confidence": 0.75,
+          "Is_Deleted": true,
+          "Correction_Notes": "corrected",
+          "Correction_Source": "manual_review_delete",
+          "Corrected_At": "2026-05-21T17:50:55"
+        },
+        {
+          "Event_Index": 46,
+          "Type": "SWD",
+          "Start_s": 13658.0654,
+          "End_s": 13663.485,
+          "Duration_s": 5.419600000001083,
+          "Confidence": null,
+          "Is_Deleted": false,
+          "Correction_Notes": "SWD",
+          "Correction_Source": "manual_review_dedupe",
+          "Corrected_At": "2026-05-21T17:53:55"
+        },
+        {
+          "Event_Index": 45,
+          "Type": "SWD",
+          "Start_s": 14290.0256,
+          "End_s": 14293.95,
+          "Duration_s": 3.9243999999998778,
+          "Confidence": null,
+          "Is_Deleted": false,
+          "Correction_Notes": "SWD",
+          "Correction_Source": "manual_review_dedupe",
+          "Corrected_At": "2026-05-21T17:53:55"
+        },
+        {
+          "Event_Index": 44,
+          "Type": "SWD",
+          "Start_s": 17790.9562,
+          "End_s": 17794.1729,
+          "Duration_s": 3.2167000000008557,
+          "Confidence": null,
+          "Is_Deleted": false,
+          "Correction_Notes": "SWD",
+          "Correction_Source": "manual_review_dedupe",
+          "Corrected_At": "2026-05-21T17:53:55"
+        },
+        {
+          "Event_Index": 38,
+          "Type": "SWD",
+          "Start_s": 19502.4029,
+          "End_s": 19506.805,
+          "Duration_s": 4.402099999999336,
+          "Confidence": 0.85,
+          "Is_Deleted": false,
+          "Correction_Notes": "SWD",
+          "Correction_Source": "manual_review",
+          "Corrected_At": "2026-05-21T17:51:14"
         }
       ]
     }

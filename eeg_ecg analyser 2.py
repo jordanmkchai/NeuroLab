@@ -1666,7 +1666,7 @@ def _close_gaps(mask, max_off_steps):
 def detect_seizures_llrms(sig, fs,
                            win_s=1.0, step_s=0.25,
                            enter_z=5.5, exit_z=3.5, off_hold_s=2.0,
-                           min_duration_s=5.0, merge_gap_s=15.0, close_s=10.0,
+                           min_duration_s=20.0, merge_gap_s=15.0, close_s=10.0,
                            hf_ratio_thr=1.6, lf_ratio_thr=0.9,
                            occupancy_min=0.45, rhythm_prom_thr=1.35,
                            entropy_drop_sigma=0.20):
@@ -2150,9 +2150,9 @@ def analyze_eeg(t, y, fs, bin_s=3600.0, debug_plots=False):
         "bin_size_s":           float(bin_s),
         "preprocess":           "rolling-median detrend + 50/100 Hz notch + 0.5-100 Hz bandpass",
         "detector_fs":          "Spikes 500 Hz | SWD 200 Hz | Seizure 250 Hz",
-        "eeg_detection_profile": "mouse_literature_guided_v6",
+        "eeg_detection_profile": "mouse_literature_guided_v7",
         "eeg_swd_criteria":      "5-9 Hz, >=4 cycles, >=1.8x local baseline, harmonic gate",
-        "eeg_seizure_criteria":  ">=8 s dense high-amplitude rhythmic/evolving spike trains; reviewed EEG corrections auto-applied by source file",
+        "eeg_seizure_criteria":  ">=20 s LL/RMS seizures or >=8 s dense high-amplitude rhythmic/evolving spike trains; reviewed EEG corrections auto-applied by source file",
         "eeg_spike_artifact_filter": "reject post-tail artifacts when 40-80 ms post/spike >0.30 and biphasic ratio <0.20",
         "eeg_spike_criteria":    "14-70 Hz transient, amp z >=7.0, width 8-100 ms, post-tail artifact filter",
     }
@@ -2298,9 +2298,9 @@ def analyze_eeg_file(
         "bin_size_s": float(bin_s),
         "preprocess": "streamed rolling-median detrend + 50/100 Hz notch + 0.5-100 Hz bandpass",
         "detector_fs": "Spikes 500 Hz | SWD 200 Hz | Seizure 250 Hz",
-        "eeg_detection_profile": "mouse_literature_guided_v6",
+        "eeg_detection_profile": "mouse_literature_guided_v7",
         "eeg_swd_criteria": "5-9 Hz, >=4 cycles, >=1.8x local baseline, harmonic gate",
-        "eeg_seizure_criteria": ">=8 s dense high-amplitude rhythmic/evolving spike trains; reviewed EEG corrections auto-applied by source file",
+        "eeg_seizure_criteria": ">=20 s LL/RMS seizures or >=8 s dense high-amplitude rhythmic/evolving spike trains; reviewed EEG corrections auto-applied by source file",
         "eeg_spike_artifact_filter": "reject post-tail artifacts when 40-80 ms post/spike >0.30 and biphasic ratio <0.20",
         "eeg_spike_criteria": "14-70 Hz transient, amp z >=7.0, width 8-100 ms, post-tail artifact filter",
         "source_file": os.path.abspath(file_path),
@@ -2582,10 +2582,38 @@ def _eeg_source_key(source_file):
     return os.path.normcase(os.path.abspath(str(source_file)))
 
 
+def _eeg_source_basename(source_file):
+    if not source_file:
+        return ""
+    return os.path.normcase(os.path.basename(str(source_file)))
+
+
+def _merge_eeg_correction_store(base, incoming):
+    out = _default_eeg_correction_store()
+    if isinstance(base, dict):
+        out.update(base)
+    out["sources"] = out.get("sources", {}) if isinstance(out.get("sources"), dict) else {}
+    if not isinstance(incoming, dict):
+        return out
+    out["version"] = max(int(out.get("version", 1) or 1), int(incoming.get("version", 1) or 1))
+    incoming_sources = incoming.get("sources", {})
+    if isinstance(incoming_sources, dict):
+        out["sources"].update(incoming_sources)
+    return out
+
+
 def load_eeg_correction_store(path=EEG_CORRECTION_STORE_FILE):
-    for candidate in [path, bundled_resource_path("eeg_corrections_v1.json")]:
+    store = _default_eeg_correction_store()
+    loaded = False
+    candidates = [bundled_resource_path("eeg_corrections_v1.json"), path]
+    seen = set()
+    for candidate in candidates:
         if not candidate or not os.path.exists(candidate):
             continue
+        candidate = os.path.abspath(candidate)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
         try:
             with open(candidate, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -2596,10 +2624,11 @@ def load_eeg_correction_store(path=EEG_CORRECTION_STORE_FILE):
             data.setdefault("sources", {})
             if not isinstance(data["sources"], dict):
                 data["sources"] = {}
-            return data
+            store = _merge_eeg_correction_store(store, data)
+            loaded = True
         except Exception:
             continue
-    return _default_eeg_correction_store()
+    return store if loaded else _default_eeg_correction_store()
 
 
 def save_eeg_correction_store(store, path=EEG_CORRECTION_STORE_FILE):
@@ -2690,12 +2719,92 @@ def _match_eeg_correction_event(df, corr):
     return best_idx
 
 
+def _eeg_correction_record_in_range(rec, t0=None, t1=None):
+    if t0 is None and t1 is None:
+        return True
+    corrections = rec.get("events", []) if isinstance(rec, dict) else []
+    if not isinstance(corrections, list) or not corrections:
+        return False
+    starts = []
+    ends = []
+    for corr in corrections:
+        if not isinstance(corr, dict):
+            continue
+        try:
+            start = float(corr.get("Start_s", 0.0))
+            end = float(corr.get("End_s", start))
+        except Exception:
+            continue
+        starts.append(start)
+        ends.append(end)
+    if not starts:
+        return False
+    if t0 is not None and max(ends) < float(t0) - 1.0:
+        return False
+    if t1 is not None and min(starts) > float(t1) + 1.0:
+        return False
+    return True
+
+
+def _find_eeg_correction_record(store, source_file, t0=None, t1=None):
+    sources = store.get("sources", {}) if isinstance(store, dict) else {}
+    if not isinstance(sources, dict):
+        return None, ""
+    source_key = _eeg_source_key(source_file)
+    rec = sources.get(source_key)
+    if isinstance(rec, dict):
+        return rec, "exact"
+
+    target_base = _eeg_source_basename(source_file)
+    if not target_base:
+        return None, ""
+    for key, candidate in sources.items():
+        if not isinstance(candidate, dict):
+            continue
+        candidate_file = candidate.get("source_file", key)
+        if _eeg_source_basename(candidate_file) != target_base and _eeg_source_basename(key) != target_base:
+            continue
+        if _eeg_correction_record_in_range(candidate, t0=t0, t1=t1):
+            return candidate, "basename"
+    return None, ""
+
+
+def suppress_auto_spikes_inside_eeg_events(events_df, margin_s=3.0):
+    df = ensure_eeg_events_schema(events_df)
+    if df.empty:
+        return df
+    blockers = df[
+        (df["Type"].isin(["SWD", "Seizure"]))
+        & (~df["Is_Deleted"].apply(_to_bool).astype(bool))
+    ]
+    if blockers.empty:
+        return df
+    intervals = sorted(
+        (float(row["Start_s"]) - margin_s, float(row["End_s"]) + margin_s)
+        for _, row in blockers.iterrows()
+    )
+    drop_indices = []
+    for idx, row in df[df["Type"] == "Spike"].iterrows():
+        if _to_bool(row.get("Is_Deleted", False)):
+            continue
+        source = str(row.get("Correction_Source", "") or "")
+        notes = str(row.get("Correction_Notes", "") or "").strip()
+        if _to_bool(row.get("Is_Corrected", False)) or notes or "manual" in source.lower() or "saved" in source.lower():
+            continue
+        t = float(row.get("Start_s", 0.0))
+        if any(a <= t <= b for a, b in intervals):
+            drop_indices.append(idx)
+    if drop_indices:
+        df = df.drop(index=drop_indices)
+    return ensure_eeg_events_schema(df)
+
+
 def apply_eeg_saved_corrections(source_file, events_df, t0=None, t1=None):
     source_key = _eeg_source_key(source_file)
     if not source_key:
         return ensure_eeg_events_schema(events_df), 0
     store = load_eeg_correction_store()
-    rec = (store.get("sources", {}) or {}).get(source_key)
+    rec, match_mode = _find_eeg_correction_record(store, source_file, t0=t0, t1=t1)
     if not isinstance(rec, dict):
         return ensure_eeg_events_schema(events_df), 0
     corrections = rec.get("events", [])
@@ -2730,7 +2839,7 @@ def apply_eeg_saved_corrections(source_file, events_df, t0=None, t1=None):
             "Is_Corrected": True,
             "Is_Deleted": deleted,
             "Corrected_At": str(corr.get("Corrected_At", "") or now_iso()),
-            "Correction_Source": "saved_eeg_correction",
+            "Correction_Source": "saved_eeg_correction" if match_mode == "exact" else "saved_eeg_correction_basename",
             "Correction_Notes": str(corr.get("Correction_Notes", "") or ""),
         }
         if idx is None:
@@ -2741,7 +2850,9 @@ def apply_eeg_saved_corrections(source_file, events_df, t0=None, t1=None):
             for col, val in payload.items():
                 df.at[idx, col] = val
         applied += 1
-    return dedupe_eeg_events(df), applied
+    df = dedupe_eeg_events(df)
+    df = suppress_auto_spikes_inside_eeg_events(df, margin_s=3.0)
+    return df, applied
 
 
 def active_eeg_events(events_df):
