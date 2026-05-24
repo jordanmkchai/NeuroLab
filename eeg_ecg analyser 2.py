@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore")
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 from scipy.signal import (butter, filtfilt, iirnotch, periodogram,
                           find_peaks, sosfiltfilt, sosfilt, resample_poly, hilbert)
@@ -2321,6 +2321,750 @@ def analyze_eeg_file(
 
 
 # ============================================================
+# 5b) TWO-CHANNEL EEG LOCALIZATION (ROUGH)
+# ============================================================
+LOCALIZATION_BANDS = [
+    ("Delta_1_4", 1.0, 4.0),
+    ("Theta_4_8", 4.0, 8.0),
+    ("SWD_5_9", 5.0, 9.0),
+    ("Beta_12_30", 12.0, 30.0),
+    ("Spike_14_70", 14.0, 70.0),
+    ("Gamma_30_80", 30.0, 80.0),
+]
+
+LOCALIZATION_LAYER_COLUMNS = [
+    "Layer_L1_Prob",
+    "Layer_L2_3_Prob",
+    "Layer_L4_Prob",
+    "Layer_L5_Prob",
+    "Layer_L6_Prob",
+    "Layer_Unknown_Prob",
+]
+
+
+def _clip_band_for_fs(fs, lo, hi):
+    hi = min(float(hi), 0.45 * float(fs))
+    lo = max(float(lo), 1e-6)
+    if hi <= lo:
+        return None
+    return lo, hi
+
+
+def _event_band_for_type(event_type, fs):
+    typ = _normalize_eeg_event_type(event_type)
+    if typ == "Spike":
+        band = (14.0, 70.0)
+    elif typ == "SWD":
+        band = (5.0, 9.0)
+    else:
+        band = (4.0, 30.0)
+    return _clip_band_for_fs(fs, band[0], band[1])
+
+
+def _safe_band_power(x, fs, lo, hi):
+    band = _clip_band_for_fs(fs, lo, hi)
+    if band is None or len(x) < 4:
+        return np.nan
+    return band_power_fft(np.asarray(x, dtype=float), fs, [band])[0]
+
+
+def _band_limited_signal(x, fs, band):
+    x = np.asarray(x, dtype=float)
+    if len(x) < 12 or band is None:
+        return x - np.nanmean(x)
+    try:
+        return bandpass_zero_phase(x, fs, band[0], band[1], order=3)
+    except Exception:
+        return x - np.nanmean(x)
+
+
+def _corr_and_lag_ch2_vs_ch1(x1, x2, fs, max_lag_s=0.25):
+    x1 = np.asarray(x1, dtype=float)
+    x2 = np.asarray(x2, dtype=float)
+    n = min(len(x1), len(x2))
+    if n < 5:
+        return np.nan, np.nan
+    x1 = x1[:n] - np.nanmean(x1[:n])
+    x2 = x2[:n] - np.nanmean(x2[:n])
+    s1 = float(np.nanstd(x1))
+    s2 = float(np.nanstd(x2))
+    if s1 <= 1e-12 or s2 <= 1e-12:
+        return np.nan, np.nan
+    max_lag = int(min(max(1, round(max_lag_s * fs)), max(1, n // 3)))
+    best_corr = -np.inf
+    best_lag = 0
+    for lag in range(-max_lag, max_lag + 1):
+        if lag > 0:
+            # Positive lag means channel 2 is delayed relative to channel 1.
+            a = x1[:-lag]
+            b = x2[lag:]
+        elif lag < 0:
+            a = x1[-lag:]
+            b = x2[:lag]
+        else:
+            a = x1
+            b = x2
+        if len(a) < 5:
+            continue
+        denom = (np.nanstd(a) * np.nanstd(b)) + 1e-12
+        corr = float(np.nanmean((a - np.nanmean(a)) * (b - np.nanmean(b))) / denom)
+        if np.isfinite(corr) and corr > best_corr:
+            best_corr = corr
+            best_lag = lag
+    if not np.isfinite(best_corr):
+        return np.nan, np.nan
+    return float(best_corr), float(best_lag * 1000.0 / fs)
+
+
+def _align_two_channel_chunk(t1, y1, t2, y2, force_fs=None, fs_hint=None):
+    if force_fs is not None:
+        t1_u, y1_u, fs = ensure_uniform_sampling(t1, y1, fs_target=float(force_fs))
+        t2_u, y2_u, _ = ensure_uniform_sampling(t2, y2, fs_target=float(force_fs))
+    else:
+        target = float(fs_hint) if fs_hint is not None else None
+        t1_u, y1_u, fs = ensure_uniform_sampling(t1, y1, fs_target=target)
+        t2_u, y2_u, _ = ensure_uniform_sampling(t2, y2, fs_target=float(fs))
+
+    start = max(float(t1_u[0]), float(t2_u[0]))
+    end = min(float(t1_u[-1]), float(t2_u[-1]))
+    if end <= start:
+        raise ValueError("Two EEG channels do not overlap in time.")
+    keep = (t1_u >= start) & (t1_u <= end)
+    t = t1_u[keep]
+    if len(t) < 3:
+        raise ValueError("Aligned two-channel chunk is too short.")
+    y1_i = np.interp(t, t1_u, y1_u)
+    y2_i = np.interp(t, t2_u, y2_u)
+    return t, y1_i, y2_i, float(fs)
+
+
+def _combine_two_channel_events(events1, events2):
+    rows = []
+    for ch, df in [("Ch1", events1), ("Ch2", events2)]:
+        df = active_eeg_events(df)
+        for _, row in df.iterrows():
+            typ = _normalize_eeg_event_type(row.get("Type", "Spike"))
+            start = float(row.get("Start_s", 0.0))
+            end = float(row.get("End_s", start))
+            if typ == "Spike":
+                end = start
+            rows.append({
+                "Type": typ,
+                "Start_s": start,
+                "End_s": end,
+                "Duration_s": max(0.0, end - start),
+                "Channels": {ch},
+                "Ch1_Detected": ch == "Ch1",
+                "Ch2_Detected": ch == "Ch2",
+            })
+
+    merged = []
+    for row in sorted(rows, key=lambda r: (r["Type"], r["Start_s"], r["End_s"])):
+        typ = row["Type"]
+        tol = 0.15 if typ == "Spike" else (0.75 if typ == "SWD" else 3.0)
+        match = None
+        for i, existing in enumerate(merged):
+            if existing["Type"] != typ:
+                continue
+            if typ == "Spike":
+                overlaps = abs(existing["Start_s"] - row["Start_s"]) <= tol
+            else:
+                overlaps = row["Start_s"] <= existing["End_s"] + tol and row["End_s"] >= existing["Start_s"] - tol
+            if overlaps:
+                match = i
+                break
+        if match is None:
+            merged.append(dict(row))
+            continue
+        existing = merged[match]
+        existing["Start_s"] = min(float(existing["Start_s"]), float(row["Start_s"]))
+        existing["End_s"] = max(float(existing["End_s"]), float(row["End_s"]))
+        if typ == "Spike":
+            existing["End_s"] = existing["Start_s"]
+        existing["Duration_s"] = max(0.0, existing["End_s"] - existing["Start_s"])
+        existing["Channels"] = set(existing["Channels"]) | set(row["Channels"])
+        existing["Ch1_Detected"] = bool(existing["Ch1_Detected"] or row["Ch1_Detected"])
+        existing["Ch2_Detected"] = bool(existing["Ch2_Detected"] or row["Ch2_Detected"])
+
+    out = []
+    for i, row in enumerate(sorted(merged, key=lambda r: (r["Start_s"], r["Type"]))):
+        channels = sorted(row.pop("Channels"))
+        row["Event_Index"] = i
+        row["Detected_Channel"] = "+".join(channels)
+        out.append(row)
+    return out
+
+
+def _layer_probabilities(event_type, high_freq_fraction, corr):
+    typ = _normalize_eeg_event_type(event_type)
+    probs = {
+        "Layer_L1_Prob": 0.05,
+        "Layer_L2_3_Prob": 0.08,
+        "Layer_L4_Prob": 0.07,
+        "Layer_L5_Prob": 0.10,
+        "Layer_L6_Prob": 0.05,
+        "Layer_Unknown_Prob": 0.65,
+    }
+    if typ == "Spike":
+        probs.update({
+            "Layer_L1_Prob": 0.08,
+            "Layer_L2_3_Prob": 0.16 if high_freq_fraction > 0.25 else 0.12,
+            "Layer_L4_Prob": 0.10,
+            "Layer_L5_Prob": 0.12,
+            "Layer_L6_Prob": 0.06,
+            "Layer_Unknown_Prob": 0.48 if high_freq_fraction > 0.25 else 0.52,
+        })
+    elif typ == "SWD":
+        probs.update({
+            "Layer_L1_Prob": 0.04,
+            "Layer_L2_3_Prob": 0.09,
+            "Layer_L4_Prob": 0.11,
+            "Layer_L5_Prob": 0.13,
+            "Layer_L6_Prob": 0.06,
+            "Layer_Unknown_Prob": 0.57,
+        })
+    elif typ == "Seizure":
+        bilateral_bonus = 0.05 if np.isfinite(corr) and corr > 0.70 else 0.0
+        probs.update({
+            "Layer_L1_Prob": 0.04,
+            "Layer_L2_3_Prob": 0.10,
+            "Layer_L4_Prob": 0.10,
+            "Layer_L5_Prob": 0.16,
+            "Layer_L6_Prob": 0.08,
+            "Layer_Unknown_Prob": 0.52 + bilateral_bonus,
+        })
+    total = sum(probs.values()) or 1.0
+    return {k: float(v / total) for k, v in probs.items()}
+
+
+def _localize_event_row(event, t, sig1, sig2, fs, ch1_label, ch2_label):
+    typ = _normalize_eeg_event_type(event.get("Type", "Spike"))
+    start = float(event.get("Start_s", 0.0))
+    end = float(event.get("End_s", start))
+    if typ == "Spike":
+        end = start
+    pad = 0.5 if typ == "Spike" else (1.0 if typ == "SWD" else 2.0)
+    a = max(float(t[0]), start - pad)
+    b = min(float(t[-1]), end + pad)
+    i0 = int(np.searchsorted(t, a))
+    i1 = int(np.searchsorted(t, b))
+    if i1 <= i0 + 4:
+        i0 = max(0, int(np.searchsorted(t, start) - round(0.25 * fs)))
+        i1 = min(len(t), int(np.searchsorted(t, start) + round(0.25 * fs)))
+    seg1 = sig1[i0:i1]
+    seg2 = sig2[i0:i1]
+    band = _event_band_for_type(typ, fs)
+
+    p1 = _safe_band_power(seg1, fs, *(band or (1.0, min(30.0, 0.45 * fs))))
+    p2 = _safe_band_power(seg2, fs, *(band or (1.0, min(30.0, 0.45 * fs))))
+    rms1 = float(np.sqrt(np.nanmean(seg1 * seg1))) if len(seg1) else np.nan
+    rms2 = float(np.sqrt(np.nanmean(seg2 * seg2))) if len(seg2) else np.nan
+    pp1 = float(np.nanpercentile(seg1, 95) - np.nanpercentile(seg1, 5)) if len(seg1) else np.nan
+    pp2 = float(np.nanpercentile(seg2, 95) - np.nanpercentile(seg2, 5)) if len(seg2) else np.nan
+
+    total1 = _safe_band_power(seg1, fs, 1.0, min(80.0, 0.45 * fs))
+    total2 = _safe_band_power(seg2, fs, 1.0, min(80.0, 0.45 * fs))
+    high1 = _safe_band_power(seg1, fs, 30.0, min(80.0, 0.45 * fs))
+    high2 = _safe_band_power(seg2, fs, 30.0, min(80.0, 0.45 * fs))
+    high_frac = float(np.nanmean([
+        high1 / (total1 + 1e-12) if np.isfinite(high1) and np.isfinite(total1) else np.nan,
+        high2 / (total2 + 1e-12) if np.isfinite(high2) and np.isfinite(total2) else np.nan,
+    ]))
+
+    score1 = float((p1 if np.isfinite(p1) else 0.0) + 0.05 * (rms1 if np.isfinite(rms1) else 0.0) ** 2)
+    score2 = float((p2 if np.isfinite(p2) else 0.0) + 0.05 * (rms2 if np.isfinite(rms2) else 0.0) ** 2)
+    asym = float((score1 - score2) / (score1 + score2 + 1e-12))
+
+    x1 = _band_limited_signal(seg1, fs, band)
+    x2 = _band_limited_signal(seg2, fs, band)
+    corr, lag_ms = _corr_and_lag_ch2_vs_ch1(x1, x2, fs, max_lag_s=0.25)
+
+    dominance = abs(asym)
+    if dominance < 0.18 or (np.isfinite(corr) and corr >= 0.78 and dominance < 0.35):
+        pred_region = f"Bilateral {ch1_label} / {ch2_label} network"
+        region_conf = float(min(0.86, 0.52 + max(0.0, corr if np.isfinite(corr) else 0.0) * 0.28 + max(0.0, 0.35 - dominance) * 0.20))
+    elif asym > 0:
+        pred_region = ch1_label
+        region_conf = float(min(0.88, 0.50 + dominance * 0.70))
+    else:
+        pred_region = ch2_label
+        region_conf = float(min(0.88, 0.50 + dominance * 0.70))
+
+    ch1_prob = float(np.clip(0.5 + asym / 2.0, 0.0, 1.0))
+    ch2_prob = float(np.clip(0.5 - asym / 2.0, 0.0, 1.0))
+    bilateral_prob = float(np.clip((corr if np.isfinite(corr) else 0.0) * 0.55 + (1.0 - dominance) * 0.35, 0.0, 1.0))
+    deep_unknown_prob = float(np.clip(0.35 + (0.20 if typ == "Seizure" else 0.0) - dominance * 0.20, 0.15, 0.75))
+
+    layer_probs = _layer_probabilities(typ, high_frac, corr)
+    layer_pred = max(layer_probs, key=layer_probs.get).replace("Layer_", "").replace("_Prob", "").replace("_", "/")
+    if layer_pred == "Unknown":
+        layer_pred = "Layer unresolved from epidural screws"
+
+    row = {
+        "Event_Index": int(event.get("Event_Index", 0)),
+        "Type": typ,
+        "Start_s": start,
+        "End_s": end,
+        "Duration_s": max(0.0, end - start),
+        "Detected_Channel": event.get("Detected_Channel", ""),
+        "Ch1_Label": ch1_label,
+        "Ch2_Label": ch2_label,
+        "Ch1_Detected": bool(event.get("Ch1_Detected", False)),
+        "Ch2_Detected": bool(event.get("Ch2_Detected", False)),
+        "Ch1_EventBand_Power": p1,
+        "Ch2_EventBand_Power": p2,
+        "Ch1_RMS": rms1,
+        "Ch2_RMS": rms2,
+        "Ch1_PeakToPeak": pp1,
+        "Ch2_PeakToPeak": pp2,
+        "Power_Asymmetry_Ch1_Positive": asym,
+        "Band_Correlation": corr,
+        "Ch2_Lag_vs_Ch1_ms": lag_ms,
+        "Predicted_Region": pred_region,
+        "Region_Confidence": region_conf,
+        "Predicted_Layer": layer_pred,
+        "Layer_Confidence": float(layer_probs.get("Layer_Unknown_Prob", np.nan)),
+        "Ch1_Region_Prob": ch1_prob,
+        "Ch2_Region_Prob": ch2_prob,
+        "Bilateral_Prob": bilateral_prob,
+        "Deep_or_Unresolved_Prob": deep_unknown_prob,
+        "Method_Note": "Rough 2-channel epidural estimate; true region/layer requires training labels and denser/depth electrodes.",
+    }
+    row.update(layer_probs)
+    return row
+
+
+def _spectral_band_rows(t, sig1, sig2, fs, core_start, core_end,
+                        window_s=4.0, step_s=10.0):
+    rows = []
+    t0 = float(t[0])
+    t1 = float(t[-1])
+    start = max(float(core_start), t0)
+    end = min(float(core_end), t1)
+    if end <= start:
+        return rows
+    centers = np.arange(start + window_s / 2.0, end - window_s / 2.0 + 1e-9, step_s)
+    if centers.size == 0:
+        centers = np.array([(start + end) / 2.0])
+    for center in centers:
+        a = max(t0, float(center) - window_s / 2.0)
+        b = min(t1, float(center) + window_s / 2.0)
+        i0 = int(np.searchsorted(t, a))
+        i1 = int(np.searchsorted(t, b))
+        if i1 <= i0 + 4:
+            continue
+        s1 = sig1[i0:i1]
+        s2 = sig2[i0:i1]
+        row = {"Window_Start_s": a, "Window_End_s": b, "Window_Center_s": float(center)}
+        for name, lo, hi in LOCALIZATION_BANDS:
+            p1 = _safe_band_power(s1, fs, lo, hi)
+            p2 = _safe_band_power(s2, fs, lo, hi)
+            row[f"Ch1_{name}_Power"] = p1
+            row[f"Ch2_{name}_Power"] = p2
+            row[f"{name}_Asymmetry_Ch1_Positive"] = (
+                float((p1 - p2) / (p1 + p2 + 1e-12))
+                if np.isfinite(p1) and np.isfinite(p2) else np.nan
+            )
+        rows.append(row)
+    return rows
+
+
+def _single_spectral_band_rows(t, sig, fs, core_start, core_end,
+                               window_s=4.0, step_s=10.0):
+    rows = []
+    t0 = float(t[0])
+    t1 = float(t[-1])
+    start = max(float(core_start), t0)
+    end = min(float(core_end), t1)
+    if end <= start:
+        return rows
+    centers = np.arange(start + window_s / 2.0, end - window_s / 2.0 + 1e-9, step_s)
+    if centers.size == 0:
+        centers = np.array([(start + end) / 2.0])
+    for center in centers:
+        a = max(t0, float(center) - window_s / 2.0)
+        b = min(t1, float(center) + window_s / 2.0)
+        i0 = int(np.searchsorted(t, a))
+        i1 = int(np.searchsorted(t, b))
+        if i1 <= i0 + 4:
+            continue
+        seg = sig[i0:i1]
+        row = {
+            "Window_Start_s": a,
+            "Window_End_s": b,
+            "Window_Center_s": float(center),
+            "RMS": float(np.sqrt(np.nanmean(seg * seg))) if len(seg) else np.nan,
+            "PeakToPeak": float(np.nanpercentile(seg, 95) - np.nanpercentile(seg, 5)) if len(seg) else np.nan,
+        }
+        powers = {}
+        for name, lo, hi in LOCALIZATION_BANDS:
+            p = _safe_band_power(seg, fs, lo, hi)
+            powers[name] = p
+            row[f"{name}_Power"] = p
+        total = np.nansum([v for v in powers.values() if np.isfinite(v)])
+        for name, value in powers.items():
+            row[f"{name}_Relative"] = float(value / (total + 1e-12)) if np.isfinite(value) else np.nan
+        rows.append(row)
+    return rows
+
+
+def summarize_spectral_bands(spectral_df):
+    df = pd.DataFrame(spectral_df).copy()
+    if df.empty:
+        return pd.DataFrame([{"Spectral_Windows": 0}])
+    rows = []
+    for name, _, _ in LOCALIZATION_BANDS:
+        col = f"{name}_Power"
+        rel = f"{name}_Relative"
+        vals = pd.to_numeric(df.get(col, np.nan), errors="coerce").dropna().to_numpy(dtype=float)
+        rel_vals = pd.to_numeric(df.get(rel, np.nan), errors="coerce").dropna().to_numpy(dtype=float)
+        rows.append({
+            "Band": name,
+            "Mean_Power": float(np.mean(vals)) if vals.size else np.nan,
+            "Median_Power": float(np.median(vals)) if vals.size else np.nan,
+            "Max_Power": float(np.max(vals)) if vals.size else np.nan,
+            "Mean_Relative": float(np.mean(rel_vals)) if rel_vals.size else np.nan,
+            "Windows": int(len(df)),
+        })
+    return pd.DataFrame(rows)
+
+
+def analyze_eeg_spectral_file(
+    file_path,
+    channel_label="EEG channel",
+    force_fs=None,
+    chunk_s=180.0,
+    overlap_s=10.0,
+    spectral_window_s=4.0,
+    spectral_step_s=10.0,
+    progress_callback=None,
+):
+    file_path = os.path.abspath(file_path)
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"EEG TSV not found: {file_path}")
+
+    text_meta = _read_text_waveform_metadata(file_path)
+    total_rows = int(text_meta.get("count", 0) or 0)
+    fs_guess = float(force_fs) if force_fs is not None else 2000.0
+    chunk_rows = int(max(50000, round(fs_guess * float(chunk_s))))
+
+    all_spectral = []
+    first_t = None
+    last_t = None
+    fs_used = float(force_fs) if force_fs is not None else None
+    prev_t = np.array([], dtype=float)
+    prev_y = np.array([], dtype=float)
+    chunks = 0
+    skipped = 0
+    processed = 0
+
+    for t_new, y_new in iter_waveform_tabular_chunks(file_path, chunk_rows=chunk_rows):
+        chunks += 1
+        processed += len(t_new)
+        if len(t_new) < 3:
+            skipped += 1
+            continue
+        if first_t is None:
+            first_t = float(t_new[0])
+        last_t = float(t_new[-1])
+        core_start = float(t_new[0])
+        core_end = float(t_new[-1])
+
+        if prev_t.size:
+            t_chunk = np.concatenate([prev_t, t_new])
+            y_chunk = np.concatenate([prev_y, y_new])
+        else:
+            t_chunk, y_chunk = t_new, y_new
+
+        try:
+            if fs_used is not None:
+                t_u, y_u, fs = ensure_uniform_sampling(t_chunk, y_chunk, fs_target=float(fs_used))
+            elif force_fs is not None:
+                t_u, y_u, fs = ensure_uniform_sampling(t_chunk, y_chunk, fs_target=float(force_fs))
+                fs_used = float(fs)
+            else:
+                t_u, y_u, fs = ensure_uniform_sampling(t_chunk, y_chunk)
+                fs_used = float(fs)
+            sig = eeg_preprocess(y_u, fs)
+            all_spectral.extend(_single_spectral_band_rows(
+                t_u, sig, fs, core_start, core_end,
+                window_s=float(spectral_window_s),
+                step_s=float(spectral_step_s),
+            ))
+        except Exception as exc:
+            skipped += 1
+            if progress_callback:
+                progress_callback(10, f"Spectral: skipped chunk {chunks} ({exc})")
+
+        keep_from = core_end - float(overlap_s)
+        keep = t_new >= keep_from
+        prev_t = t_new[keep].copy()
+        prev_y = y_new[keep].copy()
+
+        if progress_callback:
+            if total_rows > 0:
+                pct = 5 + 85 * min(1.0, processed / total_rows)
+                progress_callback(pct, f"Spectral: scanned {processed:,}/{total_rows:,} samples")
+            else:
+                progress_callback(10, f"Spectral: scanned {processed:,} samples")
+
+    if first_t is None or last_t is None:
+        raise ValueError("No valid EEG samples found.")
+
+    spectral_df = pd.DataFrame(all_spectral)
+    summary_df = summarize_spectral_bands(spectral_df)
+    meta = {
+        "source_file": file_path,
+        "channel_label": channel_label,
+        "fs_Hz": float(fs_used) if fs_used is not None else np.nan,
+        "recording_duration_s": float(last_t - first_t),
+        "spectral_profile": "single_channel_eeg_bandpower_v1",
+        "spectral_window_s": float(spectral_window_s),
+        "spectral_step_s": float(spectral_step_s),
+        "preprocess": "rolling-median detrend + 50/100 Hz notch + 0.5-100 Hz bandpass",
+        "chunk_s": float(chunk_s),
+        "overlap_s": float(overlap_s),
+        "chunks_processed": int(chunks),
+        "chunks_skipped": int(skipped),
+        "spectral_windows": int(len(spectral_df)),
+    }
+    if progress_callback:
+        progress_callback(95, "Spectral: finalizing workbook tables")
+    return spectral_df, summary_df, meta
+
+
+def export_eeg_spectral_excel(save_path, spectral_df, summary_df, meta):
+    meta = dict(meta or {})
+    meta.setdefault("generated_at", now_iso())
+    with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+        pd.DataFrame(spectral_df).to_excel(writer, index=False, sheet_name="Spectral_Bands")
+        pd.DataFrame(summary_df).to_excel(writer, index=False, sheet_name="Spectral_Summary")
+        pd.DataFrame([meta]).to_excel(writer, index=False, sheet_name="Meta")
+
+
+def summarize_eeg_localization(localization_df, ch1_label, ch2_label):
+    df = pd.DataFrame(localization_df).copy()
+    if df.empty:
+        return pd.DataFrame([{
+            "Total_Events": 0,
+            "Dominant_Region": "No events detected",
+            "Dominant_Layer": "No events detected",
+            "Caution": "No localization possible without detected events.",
+        }])
+    weights = pd.to_numeric(df.get("Region_Confidence", 0.5), errors="coerce").fillna(0.5)
+    durations = pd.to_numeric(df.get("Duration_s", 0.0), errors="coerce").fillna(0.0)
+    weights = weights * np.maximum(1.0, durations.to_numpy(dtype=float))
+    if float(np.sum(weights)) <= 0:
+        weights = np.ones(len(df), dtype=float)
+
+    def wmean(col):
+        vals = pd.to_numeric(df.get(col, np.nan), errors="coerce").to_numpy(dtype=float)
+        ok = np.isfinite(vals)
+        if not np.any(ok):
+            return np.nan
+        return float(np.average(vals[ok], weights=np.asarray(weights)[ok]))
+
+    region_scores = {
+        ch1_label: wmean("Ch1_Region_Prob"),
+        ch2_label: wmean("Ch2_Region_Prob"),
+        "Bilateral/network": wmean("Bilateral_Prob"),
+        "Deep or unresolved": wmean("Deep_or_Unresolved_Prob"),
+    }
+    layer_scores = {col.replace("Layer_", "").replace("_Prob", "").replace("_", "/"): wmean(col)
+                    for col in LOCALIZATION_LAYER_COLUMNS}
+    dominant_region = max(region_scores, key=lambda k: -np.inf if not np.isfinite(region_scores[k]) else region_scores[k])
+    dominant_layer = max(layer_scores, key=lambda k: -np.inf if not np.isfinite(layer_scores[k]) else layer_scores[k])
+    rows = [{
+        "Total_Events": int(len(df)),
+        "Spike_Events": int((df["Type"] == "Spike").sum()) if "Type" in df.columns else 0,
+        "SWD_Events": int((df["Type"] == "SWD").sum()) if "Type" in df.columns else 0,
+        "Seizure_Events": int((df["Type"] == "Seizure").sum()) if "Type" in df.columns else 0,
+        "Dominant_Region": dominant_region,
+        "Dominant_Region_Score": region_scores[dominant_region],
+        "Dominant_Layer": "Layer unresolved from epidural screws" if dominant_layer == "Unknown" else dominant_layer,
+        "Dominant_Layer_Score": layer_scores[dominant_layer],
+        "Mean_Ch1_Region_Prob": region_scores[ch1_label],
+        "Mean_Ch2_Region_Prob": region_scores[ch2_label],
+        "Mean_Bilateral_Prob": region_scores["Bilateral/network"],
+        "Mean_Deep_or_Unresolved_Prob": region_scores["Deep or unresolved"],
+        "Caution": "Two epidural somatosensory channels support lateralization/network estimates, not validated deep region or cortical layer localization.",
+    }]
+    for k, v in layer_scores.items():
+        rows[0][f"Mean_Layer_{k}_Prob"] = v
+    return pd.DataFrame(rows)
+
+
+def export_eeg_localization_excel(save_path, localization_df, overall_df,
+                                  spectral_df, detections_df, meta):
+    meta = dict(meta or {})
+    meta.setdefault("generated_at", now_iso())
+    with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+        pd.DataFrame(localization_df).to_excel(writer, index=False, sheet_name="Event_Localization")
+        pd.DataFrame(overall_df).to_excel(writer, index=False, sheet_name="Overall_Localization")
+        pd.DataFrame(spectral_df).to_excel(writer, index=False, sheet_name="Spectral_Bands")
+        pd.DataFrame(detections_df).to_excel(writer, index=False, sheet_name="Channel_Event_Detections")
+        pd.DataFrame([meta]).to_excel(writer, index=False, sheet_name="Meta")
+
+
+def analyze_eeg_localization_files(
+    ch1_path,
+    ch2_path,
+    ch1_label="Left somatosensory cortex",
+    ch2_label="Right somatosensory cortex",
+    force_fs=None,
+    chunk_s=180.0,
+    overlap_s=10.0,
+    spectral_window_s=4.0,
+    spectral_step_s=10.0,
+    progress_callback=None,
+):
+    ch1_path = os.path.abspath(ch1_path)
+    ch2_path = os.path.abspath(ch2_path)
+    if not os.path.exists(ch1_path):
+        raise FileNotFoundError(f"Channel 1 TSV not found: {ch1_path}")
+    if not os.path.exists(ch2_path):
+        raise FileNotFoundError(f"Channel 2 TSV not found: {ch2_path}")
+
+    text_meta = _read_text_waveform_metadata(ch1_path)
+    total_rows = int(text_meta.get("count", 0) or 0)
+    fs_guess = float(force_fs) if force_fs is not None else 2000.0
+    chunk_rows = int(max(50000, round(fs_guess * float(chunk_s))))
+
+    all_localized = []
+    all_spectral = []
+    all_detections = []
+    first_t = None
+    last_t = None
+    fs_used = float(force_fs) if force_fs is not None else None
+    chunks = 0
+    processed = 0
+    skipped = 0
+    prev1_t = np.array([], dtype=float)
+    prev1_y = np.array([], dtype=float)
+    prev2_t = np.array([], dtype=float)
+    prev2_y = np.array([], dtype=float)
+
+    iter1 = iter_waveform_tabular_chunks(ch1_path, chunk_rows=chunk_rows)
+    iter2 = iter_waveform_tabular_chunks(ch2_path, chunk_rows=chunk_rows)
+    for pair in zip(iter1, iter2):
+        (t1_new, y1_new), (t2_new, y2_new) = pair
+        chunks += 1
+        processed += len(t1_new)
+        if len(t1_new) < 3 or len(t2_new) < 3:
+            skipped += 1
+            continue
+        if first_t is None:
+            first_t = max(float(t1_new[0]), float(t2_new[0]))
+        last_t = min(float(t1_new[-1]), float(t2_new[-1]))
+        core_start = max(float(t1_new[0]), float(t2_new[0]))
+        core_end = min(float(t1_new[-1]), float(t2_new[-1]))
+
+        if prev1_t.size:
+            t1_chunk = np.concatenate([prev1_t, t1_new])
+            y1_chunk = np.concatenate([prev1_y, y1_new])
+            t2_chunk = np.concatenate([prev2_t, t2_new])
+            y2_chunk = np.concatenate([prev2_y, y2_new])
+        else:
+            t1_chunk, y1_chunk = t1_new, y1_new
+            t2_chunk, y2_chunk = t2_new, y2_new
+
+        try:
+            t_u, y1_u, y2_u, fs = _align_two_channel_chunk(
+                t1_chunk, y1_chunk, t2_chunk, y2_chunk,
+                force_fs=force_fs,
+                fs_hint=fs_used,
+            )
+            fs_used = float(fs)
+            sig1 = eeg_preprocess(y1_u, fs)
+            sig2 = eeg_preprocess(y2_u, fs)
+            _, events1, _ = analyze_eeg(t_u, y1_u, fs, bin_s=3600.0, debug_plots=False)
+            _, events2, _ = analyze_eeg(t_u, y2_u, fs, bin_s=3600.0, debug_plots=False)
+            combined_events = _combine_two_channel_events(events1, events2)
+            for event in combined_events:
+                if event["End_s"] < core_start or event["Start_s"] >= core_end:
+                    continue
+                row = _localize_event_row(event, t_u, sig1, sig2, fs, ch1_label, ch2_label)
+                row["Event_Index"] = len(all_localized)
+                all_localized.append(row)
+            for channel_name, events_df in [("Ch1", events1), ("Ch2", events2)]:
+                for _, row in active_eeg_events(events_df).iterrows():
+                    start = float(row["Start_s"])
+                    end = float(row["End_s"])
+                    if end < core_start or start >= core_end:
+                        continue
+                    all_detections.append({
+                        "Channel": channel_name,
+                        "Channel_Label": ch1_label if channel_name == "Ch1" else ch2_label,
+                        "Type": _normalize_eeg_event_type(row["Type"]),
+                        "Start_s": start,
+                        "End_s": end,
+                        "Duration_s": float(row["Duration_s"]),
+                        "Confidence": row.get("Confidence", np.nan),
+                    })
+            all_spectral.extend(_spectral_band_rows(
+                t_u, sig1, sig2, fs, core_start, core_end,
+                window_s=float(spectral_window_s),
+                step_s=float(spectral_step_s),
+            ))
+        except Exception as exc:
+            skipped += 1
+            if progress_callback:
+                progress_callback(10, f"Localization: skipped chunk {chunks} ({exc})")
+
+        keep_from = core_end - float(overlap_s)
+        keep1 = t1_new >= keep_from
+        keep2 = t2_new >= keep_from
+        prev1_t, prev1_y = t1_new[keep1].copy(), y1_new[keep1].copy()
+        prev2_t, prev2_y = t2_new[keep2].copy(), y2_new[keep2].copy()
+
+        if progress_callback:
+            if total_rows > 0:
+                pct = 5 + 85 * min(1.0, processed / total_rows)
+                progress_callback(pct, f"Localization: scanned {processed:,}/{total_rows:,} samples")
+            else:
+                progress_callback(10, f"Localization: scanned {processed:,} samples")
+
+    if first_t is None or last_t is None:
+        raise ValueError("No valid synchronized EEG samples found.")
+
+    loc_df = pd.DataFrame(all_localized)
+    if len(loc_df):
+        loc_df = loc_df.sort_values(["Start_s", "Type"]).reset_index(drop=True)
+        loc_df["Event_Index"] = np.arange(len(loc_df), dtype=int)
+    else:
+        loc_df = pd.DataFrame(columns=[
+            "Event_Index", "Type", "Start_s", "End_s", "Predicted_Region", "Predicted_Layer",
+            "Region_Confidence", "Method_Note",
+        ])
+    spectral_df = pd.DataFrame(all_spectral)
+    detections_df = pd.DataFrame(all_detections, columns=[
+        "Channel", "Channel_Label", "Type", "Start_s", "End_s", "Duration_s", "Confidence"
+    ])
+    overall_df = summarize_eeg_localization(loc_df, ch1_label, ch2_label)
+    meta = {
+        "source_file_ch1": ch1_path,
+        "source_file_ch2": ch2_path,
+        "ch1_label": ch1_label,
+        "ch2_label": ch2_label,
+        "fs_Hz": float(fs_used) if fs_used is not None else np.nan,
+        "recording_duration_s": float(last_t - first_t),
+        "localization_profile": "two_channel_epidural_somatosensory_v1",
+        "localization_limit": "Two epidural screw channels cannot uniquely determine deep brain region or cortical layer; output is rough lateralization/network probability.",
+        "spectral_window_s": float(spectral_window_s),
+        "spectral_step_s": float(spectral_step_s),
+        "chunk_s": float(chunk_s),
+        "overlap_s": float(overlap_s),
+        "chunks_processed": int(chunks),
+        "chunks_skipped": int(skipped),
+        "events_localized": int(len(loc_df)),
+        "spectral_windows": int(len(spectral_df)),
+    }
+    if progress_callback:
+        progress_callback(95, "Localization: finalizing workbook tables")
+    return loc_df, overall_df, spectral_df, detections_df, meta
+
+
+# ============================================================
 # 6) EXCEL EXPORT
 # ============================================================
 def export_ecg_excel(save_path, beat_rows, meta):
@@ -4064,6 +4808,313 @@ class EEGReviewWindow(tk.Toplevel):
         )
 
 
+class EEGSpectralResultsWindow(tk.Toplevel):
+    def __init__(self, parent, workbook_path, spectral_df, summary_df, meta):
+        super().__init__(parent)
+        self.title("EEG Spectral Data")
+        self.geometry("1100x720")
+        self.workbook_path = workbook_path
+        self.spectral_df = pd.DataFrame(spectral_df)
+        self.summary_df = pd.DataFrame(summary_df)
+        self.meta = dict(meta or {})
+        self._build()
+
+    def _build(self):
+        top = tk.Frame(self)
+        top.pack(fill="x", padx=10, pady=8)
+        tk.Label(top, text=f"Saved: {self.workbook_path}", anchor="w", wraplength=950).pack(side="left", fill="x", expand=True)
+        tk.Button(top, text="Close", command=self.destroy).pack(side="right")
+
+        fig, axes = plt.subplots(2, 1, figsize=(10.5, 6.2), sharex=True)
+        df = self.spectral_df
+        if len(df) and "Window_Center_s" in df.columns:
+            x = pd.to_numeric(df["Window_Center_s"], errors="coerce") / 60.0
+            for band, color in [("Delta_1_4", "#607D8B"), ("SWD_5_9", "#0288D1"),
+                                ("Spike_14_70", "#F9A825"), ("Gamma_30_80", "#8E24AA")]:
+                col = f"{band}_Relative"
+                if col in df.columns:
+                    axes[0].plot(x, pd.to_numeric(df[col], errors="coerce"), lw=0.9, label=band, color=color)
+            axes[0].set_ylabel("Relative power")
+            axes[0].legend(loc="upper right", fontsize=8)
+            for band, color in [("SWD_5_9", "#0288D1"), ("Spike_14_70", "#F9A825")]:
+                col = f"{band}_Power"
+                if col in df.columns:
+                    vals = pd.to_numeric(df[col], errors="coerce")
+                    axes[1].plot(x, np.log10(vals + 1e-12), lw=0.9, label=f"log10 {band}", color=color)
+            axes[1].set_ylabel("log10 power")
+            axes[1].set_xlabel("Time (min)")
+            axes[1].legend(loc="upper right", fontsize=8)
+        for ax in axes:
+            ax.grid(alpha=0.25)
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, self).update()
+
+
+class EEGLocalizationResultsWindow(tk.Toplevel):
+    def __init__(self, parent, workbook_path, loc_df, overall_df, spectral_df, meta):
+        super().__init__(parent)
+        self.title("EEG Localization Preview")
+        self.geometry("1220x780")
+        self.workbook_path = workbook_path
+        self.loc_df = pd.DataFrame(loc_df)
+        self.overall_df = pd.DataFrame(overall_df)
+        self.spectral_df = pd.DataFrame(spectral_df)
+        self.meta = dict(meta or {})
+        self._build()
+
+    def _build(self):
+        top = tk.Frame(self)
+        top.pack(fill="x", padx=10, pady=8)
+        dominant = self.overall_df.iloc[0].to_dict() if len(self.overall_df) else {}
+        text = (
+            f"Saved: {self.workbook_path}\n"
+            f"Dominant region: {dominant.get('Dominant_Region', '')} | "
+            f"Dominant layer: {dominant.get('Dominant_Layer', '')}"
+        )
+        tk.Label(top, text=text, anchor="w", justify="left", wraplength=1000).pack(side="left", fill="x", expand=True)
+        tk.Button(top, text="Close", command=self.destroy).pack(side="right")
+
+        fig = plt.figure(figsize=(12, 6.8))
+        ax1 = fig.add_subplot(2, 2, 1)
+        ax2 = fig.add_subplot(2, 2, 3, sharex=ax1)
+        ax3 = fig.add_subplot(1, 2, 2, projection="3d")
+        df = self.spectral_df
+        if len(df) and "Window_Center_s" in df.columns:
+            x = pd.to_numeric(df["Window_Center_s"], errors="coerce") / 60.0
+            for band, color in [("SWD_5_9", "#0288D1"), ("Spike_14_70", "#F9A825")]:
+                c1 = f"Ch1_{band}_Power"
+                c2 = f"Ch2_{band}_Power"
+                if c1 in df.columns:
+                    ax1.plot(x, np.log10(pd.to_numeric(df[c1], errors="coerce") + 1e-12),
+                             lw=0.8, color=color, label=f"Ch1 {band}")
+                if c2 in df.columns:
+                    ax1.plot(x, np.log10(pd.to_numeric(df[c2], errors="coerce") + 1e-12),
+                             lw=0.8, color=color, ls="--", label=f"Ch2 {band}")
+            asym_col = "SWD_5_9_Asymmetry_Ch1_Positive"
+            if asym_col in df.columns:
+                ax2.plot(x, pd.to_numeric(df[asym_col], errors="coerce"), color="#0288D1", lw=0.8, label="SWD asymmetry")
+            asym_col = "Spike_14_70_Asymmetry_Ch1_Positive"
+            if asym_col in df.columns:
+                ax2.plot(x, pd.to_numeric(df[asym_col], errors="coerce"), color="#F9A825", lw=0.8, label="Spike asymmetry")
+            ax2.axhline(0, color="#333333", lw=0.7)
+            ax1.set_ylabel("log10 power")
+            ax2.set_ylabel("Ch1 positive asymmetry")
+            ax2.set_xlabel("Time (min)")
+            ax1.legend(fontsize=7, loc="upper right")
+            ax2.legend(fontsize=7, loc="upper right")
+        for ax in [ax1, ax2]:
+            ax.grid(alpha=0.25)
+
+        row = dominant
+        ch1_label = str(self.meta.get("ch1_label", "Channel 1"))
+        ch2_label = str(self.meta.get("ch2_label", "Channel 2"))
+        ch1 = float(row.get("Mean_Ch1_Region_Prob", 0.0) or 0.0)
+        ch2 = float(row.get("Mean_Ch2_Region_Prob", 0.0) or 0.0)
+        bilateral = float(row.get("Mean_Bilateral_Prob", 0.0) or 0.0)
+        unresolved = float(row.get("Mean_Deep_or_Unresolved_Prob", 0.0) or 0.0)
+        vals = [ch1, ch2]
+        colors = [plt.cm.Oranges(np.clip(ch1, 0.15, 1.0)), plt.cm.Blues(np.clip(ch2, 0.15, 1.0))]
+        xs = [-1.2, 1.2]
+        for x0, val, color, label in zip(xs, vals, colors, [ch1_label, ch2_label]):
+            ax3.bar3d(x0, -0.45, 0, 0.9, 0.9, max(0.08, val), color=color, alpha=0.85, shade=True)
+            ax3.text(x0 + 0.45, 0, max(0.1, val) + 0.05, label, ha="center", va="bottom", fontsize=8)
+        ax3.plot([-0.75, 0.75], [0, 0], [max(0.08, bilateral)] * 2, color="#43A047", lw=5, alpha=np.clip(bilateral, 0.15, 1.0))
+        ax3.text(0, 0.55, max(0.1, bilateral) + 0.05, f"Bilateral/network {bilateral:.2f}", ha="center", fontsize=8)
+        ax3.text(0, -0.85, 0.05, f"Unresolved/deep {unresolved:.2f}", ha="center", fontsize=8)
+        for z, layer in zip(np.linspace(0.05, 0.85, 6), ["L1", "L2/3", "L4", "L5", "L6", "?"]):
+            ax3.plot([-1.4, 1.4], [1.0, 1.0], [z, z], color="#777777", lw=0.8, alpha=0.45)
+            ax3.text(1.55, 1.0, z, layer, fontsize=7)
+        ax3.set_title("Rotatable rough 3D cortical map")
+        ax3.set_xlim(-2.0, 2.0)
+        ax3.set_ylim(-1.2, 1.4)
+        ax3.set_zlim(0, 1.2)
+        ax3.set_axis_off()
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        NavigationToolbar2Tk(canvas, self).update()
+
+
+class EEGSpectralToolWindow(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Single-Channel EEG Spectral Converter")
+        self.geometry("760x330")
+        self.input_path = tk.StringVar(value="")
+        self.output_path = tk.StringVar(value="")
+        self.channel_label = tk.StringVar(value="EEG channel")
+        self.status_var = tk.StringVar(value="Ready")
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="Convert one EEG TSV channel to spectral band data", font=("Arial", 13, "bold")).pack(pady=(10, 4))
+        body = tk.Frame(self)
+        body.pack(fill="x", padx=12, pady=8)
+        for i in range(3):
+            body.columnconfigure(i, weight=1 if i == 1 else 0)
+        tk.Label(body, text="Input TSV").grid(row=0, column=0, sticky="w", pady=4)
+        tk.Entry(body, textvariable=self.input_path).grid(row=0, column=1, sticky="ew", padx=6)
+        tk.Button(body, text="Browse", command=self._browse_input).grid(row=0, column=2, padx=4)
+        tk.Label(body, text="Output XLSX").grid(row=1, column=0, sticky="w", pady=4)
+        tk.Entry(body, textvariable=self.output_path).grid(row=1, column=1, sticky="ew", padx=6)
+        tk.Button(body, text="Save As", command=self._browse_output).grid(row=1, column=2, padx=4)
+        tk.Label(body, text="Channel label").grid(row=2, column=0, sticky="w", pady=4)
+        tk.Entry(body, textvariable=self.channel_label).grid(row=2, column=1, sticky="ew", padx=6)
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(self, textvariable=self.status_var, anchor="w").pack(fill="x", padx=12)
+        btns = tk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=12)
+        self.run_btn = tk.Button(btns, text="Convert + Save Workbook", bg="#0288D1", fg="white", command=self._run)
+        self.run_btn.pack(side="left")
+        tk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+    def _browse_input(self):
+        path = filedialog.askopenfilename(parent=self, title="Select EEG TSV",
+                                          filetypes=[("TSV/TXT/CSV/Excel", "*.tsv *.txt *.csv *.xlsx *.xls"), ("All", "*.*")])
+        if path:
+            self.input_path.set(path)
+            if not self.output_path.get():
+                stem = os.path.splitext(os.path.basename(path))[0]
+                self.output_path.set(os.path.join(os.path.dirname(path), f"{stem}_EEG_spectral.xlsx"))
+
+    def _browse_output(self):
+        path = filedialog.asksaveasfilename(parent=self, defaultextension=".xlsx",
+                                            filetypes=[("Excel", "*.xlsx")], title="Save spectral workbook")
+        if path:
+            self.output_path.set(path)
+
+    def _progress(self, pct, msg):
+        self.after(0, lambda: (self.progress.config(value=float(pct)), self.status_var.set(msg)))
+
+    def _run(self):
+        if not self.input_path.get() or not self.output_path.get():
+            messagebox.showerror("Missing input", "Select input TSV and output workbook.", parent=self)
+            return
+        self.run_btn.config(state="disabled")
+        self.status_var.set("Running spectral conversion...")
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        try:
+            spectral_df, summary_df, meta = analyze_eeg_spectral_file(
+                self.input_path.get(),
+                channel_label=self.channel_label.get().strip() or "EEG channel",
+                progress_callback=self._progress,
+            )
+            export_eeg_spectral_excel(self.output_path.get(), spectral_df, summary_df, meta)
+            self.after(0, lambda: self._done(spectral_df, summary_df, meta))
+        except Exception as exc:
+            self.after(0, lambda: (self.run_btn.config(state="normal"), messagebox.showerror("Spectral failed", str(exc), parent=self)))
+
+    def _done(self, spectral_df, summary_df, meta):
+        self.progress.config(value=100)
+        self.status_var.set(f"Saved: {self.output_path.get()}")
+        self.run_btn.config(state="normal")
+        EEGSpectralResultsWindow(self, self.output_path.get(), spectral_df, summary_df, meta)
+
+
+class EEGLocalizationToolWindow(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Two-Channel EEG Localization")
+        self.geometry("820x410")
+        self.ch1_path = tk.StringVar(value="")
+        self.ch2_path = tk.StringVar(value="")
+        self.output_path = tk.StringVar(value="")
+        self.ch1_label = tk.StringVar(value="Left somatosensory cortex")
+        self.ch2_label = tk.StringVar(value="Right somatosensory cortex")
+        self.status_var = tk.StringVar(value="Ready")
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="Rough 2-channel epidural EEG localization", font=("Arial", 13, "bold")).pack(pady=(10, 2))
+        tk.Label(self, text="Method limit: this can lateralize/network-score bilateral S1 activity, not validate deep region or cortical layer.",
+                 fg="#8A6D00", wraplength=760).pack(pady=(0, 8))
+        body = tk.Frame(self)
+        body.pack(fill="x", padx=12, pady=6)
+        body.columnconfigure(1, weight=1)
+        rows = [
+            ("Channel 1 TSV", self.ch1_path, self._browse_ch1),
+            ("Channel 2 TSV", self.ch2_path, self._browse_ch2),
+            ("Output XLSX", self.output_path, self._browse_output),
+        ]
+        for r, (label, var, cmd) in enumerate(rows):
+            tk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Entry(body, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6)
+            tk.Button(body, text="Browse" if r < 2 else "Save As", command=cmd).grid(row=r, column=2, padx=4)
+        tk.Label(body, text="Ch1 label").grid(row=3, column=0, sticky="w", pady=4)
+        tk.Entry(body, textvariable=self.ch1_label).grid(row=3, column=1, sticky="ew", padx=6)
+        tk.Label(body, text="Ch2 label").grid(row=4, column=0, sticky="w", pady=4)
+        tk.Entry(body, textvariable=self.ch2_label).grid(row=4, column=1, sticky="ew", padx=6)
+        self.progress = ttk.Progressbar(self, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(self, textvariable=self.status_var, anchor="w").pack(fill="x", padx=12)
+        btns = tk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=12)
+        self.run_btn = tk.Button(btns, text="Predict + Save Workbook", bg="#6A1B9A", fg="white", command=self._run)
+        self.run_btn.pack(side="left")
+        tk.Button(btns, text="Close", command=self.destroy).pack(side="right")
+
+    def _browse_file(self):
+        return filedialog.askopenfilename(parent=self, title="Select EEG channel TSV",
+                                          filetypes=[("TSV/TXT/CSV/Excel", "*.tsv *.txt *.csv *.xlsx *.xls"), ("All", "*.*")])
+
+    def _browse_ch1(self):
+        path = self._browse_file()
+        if path:
+            self.ch1_path.set(path)
+            if not self.output_path.get():
+                stem = os.path.splitext(os.path.basename(path))[0]
+                self.output_path.set(os.path.join(os.path.dirname(path), f"{stem}_EEG_localization.xlsx"))
+
+    def _browse_ch2(self):
+        path = self._browse_file()
+        if path:
+            self.ch2_path.set(path)
+
+    def _browse_output(self):
+        path = filedialog.asksaveasfilename(parent=self, defaultextension=".xlsx",
+                                            filetypes=[("Excel", "*.xlsx")], title="Save localization workbook")
+        if path:
+            self.output_path.set(path)
+
+    def _progress(self, pct, msg):
+        self.after(0, lambda: (self.progress.config(value=float(pct)), self.status_var.set(msg)))
+
+    def _run(self):
+        if not self.ch1_path.get() or not self.ch2_path.get() or not self.output_path.get():
+            messagebox.showerror("Missing input", "Select both channel TSV files and output workbook.", parent=self)
+            return
+        self.run_btn.config(state="disabled")
+        self.status_var.set("Running two-channel localization...")
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        try:
+            loc_df, overall_df, spectral_df, detections_df, meta = analyze_eeg_localization_files(
+                self.ch1_path.get(),
+                self.ch2_path.get(),
+                ch1_label=self.ch1_label.get().strip() or "Channel 1",
+                ch2_label=self.ch2_label.get().strip() or "Channel 2",
+                progress_callback=self._progress,
+            )
+            export_eeg_localization_excel(self.output_path.get(), loc_df, overall_df, spectral_df, detections_df, meta)
+            self.after(0, lambda: self._done(loc_df, overall_df, spectral_df, meta))
+        except Exception as exc:
+            self.after(0, lambda: (self.run_btn.config(state="normal"), messagebox.showerror("Localization failed", str(exc), parent=self)))
+
+    def _done(self, loc_df, overall_df, spectral_df, meta):
+        self.progress.config(value=100)
+        self.status_var.set(f"Saved: {self.output_path.get()}")
+        self.run_btn.config(state="normal")
+        EEGLocalizationResultsWindow(self, self.output_path.get(), loc_df, overall_df, spectral_df, meta)
+
+
 # ============================================================
 # 8) UNIFIED GUI
 # ============================================================
@@ -4072,7 +5123,7 @@ class UnifiedAnalyzerApp:
         self.root         = root
         self._main_thread_id = threading.get_ident()
         self.root.title("SUDEP Waveform Analyzer — EEG / ECG")
-        self.root.geometry("920x700")
+        self.root.geometry("1120x720")
         self.root.resizable(True, True)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self.input_file   = None
@@ -4177,6 +5228,14 @@ class UnifiedAnalyzerApp:
                                         bg="#00695C", fg="white",
                                         font=("Arial", 11, "bold"), padx=16, pady=10)
         self.review_eeg_btn.pack(side="left", padx=8)
+        tk.Button(btn_f, text="EEG Spectral",
+                  command=self._open_eeg_spectral_tool,
+                  bg="#0288D1", fg="white",
+                  font=("Arial", 11, "bold"), padx=12, pady=10).pack(side="left", padx=8)
+        tk.Button(btn_f, text="EEG Localization",
+                  command=self._open_eeg_localization_tool,
+                  bg="#4527A0", fg="white",
+                  font=("Arial", 11, "bold"), padx=12, pady=10).pack(side="left", padx=8)
         tk.Button(btn_f, text="Reset", command=self._reset,
                   bg="#E53935", fg="white",
                   font=("Arial", 11, "bold"), padx=16, pady=10).pack(side="left", padx=8)
@@ -4720,6 +5779,18 @@ class UnifiedAnalyzerApp:
         except Exception as exc:
             messagebox.showerror("EEG review failed", str(exc))
 
+    def _open_eeg_spectral_tool(self):
+        try:
+            EEGSpectralToolWindow(self.root)
+        except Exception as exc:
+            messagebox.showerror("EEG spectral tool failed", str(exc))
+
+    def _open_eeg_localization_tool(self):
+        try:
+            EEGLocalizationToolWindow(self.root)
+        except Exception as exc:
+            messagebox.showerror("EEG localization tool failed", str(exc))
+
     def _reset(self):
         self.input_file   = None
         self.results      = None
@@ -4996,6 +6067,86 @@ def cli_debug_eeg(args):
     return 0
 
 
+def cli_spectral_eeg(args):
+    input_path = os.path.abspath(args.input)
+    last_progress = {"pct": -10.0}
+
+    def _cli_progress(pct, msg):
+        if pct - last_progress["pct"] >= 5.0 or pct >= 95:
+            print(f"{float(pct):5.1f}%  {msg}", flush=True)
+            last_progress["pct"] = float(pct)
+
+    spectral_df, summary_df, meta = analyze_eeg_spectral_file(
+        input_path,
+        channel_label=str(args.channel_label),
+        force_fs=args.force_fs,
+        chunk_s=float(args.chunk_s),
+        spectral_window_s=float(args.window_s),
+        spectral_step_s=float(args.step_s),
+        progress_callback=_cli_progress,
+    )
+    output_path = args.output
+    if not output_path:
+        stem = os.path.splitext(os.path.basename(input_path))[0]
+        output_path = os.path.join(os.path.dirname(input_path), f"{stem}_EEG_spectral.xlsx")
+    output_path = os.path.abspath(output_path)
+    if not args.no_export:
+        export_eeg_spectral_excel(output_path, spectral_df, summary_df, meta)
+
+    print("=== CLI EEG SPECTRAL ===")
+    print(f"Input            : {input_path}")
+    print(f"Channel label    : {meta.get('channel_label')}")
+    print(f"Sampling rate Hz : {float(meta.get('fs_Hz', np.nan)):.3f}")
+    print(f"Duration s       : {float(meta.get('recording_duration_s', np.nan)):.3f}")
+    print(f"Spectral windows : {int(meta.get('spectral_windows', 0))}")
+    if not args.no_export:
+        print(f"Workbook         : {output_path}")
+    return 0
+
+
+def cli_localize_eeg(args):
+    ch1_path = os.path.abspath(args.ch1)
+    ch2_path = os.path.abspath(args.ch2)
+    last_progress = {"pct": -10.0}
+
+    def _cli_progress(pct, msg):
+        if pct - last_progress["pct"] >= 5.0 or pct >= 95:
+            print(f"{float(pct):5.1f}%  {msg}", flush=True)
+            last_progress["pct"] = float(pct)
+
+    loc_df, overall_df, spectral_df, detections_df, meta = analyze_eeg_localization_files(
+        ch1_path,
+        ch2_path,
+        ch1_label=str(args.ch1_label),
+        ch2_label=str(args.ch2_label),
+        force_fs=args.force_fs,
+        chunk_s=float(args.chunk_s),
+        spectral_window_s=float(args.window_s),
+        spectral_step_s=float(args.step_s),
+        progress_callback=_cli_progress,
+    )
+    output_path = args.output
+    if not output_path:
+        stem = os.path.splitext(os.path.basename(ch1_path))[0]
+        output_path = os.path.join(os.path.dirname(ch1_path), f"{stem}_EEG_localization.xlsx")
+    output_path = os.path.abspath(output_path)
+    if not args.no_export:
+        export_eeg_localization_excel(output_path, loc_df, overall_df, spectral_df, detections_df, meta)
+
+    dominant = overall_df.iloc[0].to_dict() if len(overall_df) else {}
+    print("=== CLI EEG LOCALIZATION ===")
+    print(f"Channel 1        : {ch1_path}")
+    print(f"Channel 2        : {ch2_path}")
+    print(f"Sampling rate Hz : {float(meta.get('fs_Hz', np.nan)):.3f}")
+    print(f"Duration s       : {float(meta.get('recording_duration_s', np.nan)):.3f}")
+    print(f"Events localized : {int(meta.get('events_localized', 0))}")
+    print(f"Dominant region  : {dominant.get('Dominant_Region', '')}")
+    print(f"Dominant layer   : {dominant.get('Dominant_Layer', '')}")
+    if not args.no_export:
+        print(f"Workbook         : {output_path}")
+    return 0
+
+
 def cli_review_eeg(args):
     workbook = os.path.abspath(args.workbook)
     summary_df, events_df, meta = load_eeg_workbook(workbook)
@@ -5154,6 +6305,28 @@ def build_cli_parser():
     p_dbg_eeg.add_argument("--candidate-count", type=int, default=2,
                            help="Candidate windows per missed manual seizure bin")
 
+    p_spec_eeg = sub.add_parser("spectral-eeg", help="Convert one EEG channel TSV to spectral band workbook")
+    p_spec_eeg.add_argument("--input", required=True, help="Input EEG waveform file")
+    p_spec_eeg.add_argument("--output", default="", help="Output workbook path (.xlsx)")
+    p_spec_eeg.add_argument("--channel-label", default="EEG channel", help="Channel label for metadata")
+    p_spec_eeg.add_argument("--force-fs", type=float, default=None, help="Force target sampling rate Hz")
+    p_spec_eeg.add_argument("--chunk-s", type=float, default=180.0, help="Streaming chunk size in seconds")
+    p_spec_eeg.add_argument("--window-s", type=float, default=4.0, help="Spectral window length in seconds")
+    p_spec_eeg.add_argument("--step-s", type=float, default=10.0, help="Spectral step size in seconds")
+    p_spec_eeg.add_argument("--no-export", action="store_true", help="Run conversion without writing workbook")
+
+    p_loc_eeg = sub.add_parser("localize-eeg", help="Rough two-channel EEG spectral localization")
+    p_loc_eeg.add_argument("--ch1", required=True, help="Channel 1 EEG waveform file")
+    p_loc_eeg.add_argument("--ch2", required=True, help="Channel 2 EEG waveform file")
+    p_loc_eeg.add_argument("--output", default="", help="Output workbook path (.xlsx)")
+    p_loc_eeg.add_argument("--ch1-label", default="Left somatosensory cortex", help="Channel 1 electrode label")
+    p_loc_eeg.add_argument("--ch2-label", default="Right somatosensory cortex", help="Channel 2 electrode label")
+    p_loc_eeg.add_argument("--force-fs", type=float, default=None, help="Force target sampling rate Hz")
+    p_loc_eeg.add_argument("--chunk-s", type=float, default=180.0, help="Streaming chunk size in seconds")
+    p_loc_eeg.add_argument("--window-s", type=float, default=4.0, help="Spectral window length in seconds")
+    p_loc_eeg.add_argument("--step-s", type=float, default=10.0, help="Spectral step size in seconds")
+    p_loc_eeg.add_argument("--no-export", action="store_true", help="Run analysis without writing workbook")
+
     p_rev_eeg = sub.add_parser("review-eeg", help="Recompute/revalidate an exported EEG workbook")
     p_rev_eeg.add_argument("--workbook", required=True, help="Existing EEG workbook path")
     p_rev_eeg.add_argument("--output", default="", help="Output workbook path (defaults to overwrite input)")
@@ -5194,6 +6367,10 @@ def run_cli(argv=None):
         return cli_benchmark_eeg(args)
     if args.command == "debug-eeg":
         return cli_debug_eeg(args)
+    if args.command == "spectral-eeg":
+        return cli_spectral_eeg(args)
+    if args.command == "localize-eeg":
+        return cli_localize_eeg(args)
     if args.command == "review-eeg":
         return cli_review_eeg(args)
     if args.command == "review-eeg-ui":
