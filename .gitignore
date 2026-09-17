@@ -1,8 +1,0 @@
-917_eeg_test_first5min.tsv
-__pycache__/
-*.pyc
-.venv/
-build/
-dist/
-release/
-*.log
